@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -22,8 +24,17 @@ sys.path.insert(0, str(BASE_DIR))
 os.chdir(BASE_DIR)
 
 import settings  # noqa: E402
+import device_control  # noqa: E402
 import web_server  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+
+# Тесты не должны трогать рабочий реестр устройств: уводим его в временный файл.
+device_control.DEVICES_FILE = Path(tempfile.mkdtemp(prefix="luch_selftest_")) / "devices.json"
+with device_control.devices_lock:
+    device_control.devices.clear()
+    device_control.queue.clear()
+    device_control._acked.clear()
+    device_control.results.clear()
 
 PASSED: list[str] = []
 FAILED: list[tuple[str, str]] = []
