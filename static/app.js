@@ -162,22 +162,31 @@
         }
 
         // ThreeJS грузим только когда 3D реально включён: экономим трафик и CPU
+        let threeLoadWaiters = [];   // ждут конца загрузки; на провале CDN тоже резолвятся
         function ensureThree() {
             if (typeof THREE !== 'undefined') { threeLoadState = 'ready'; return Promise.resolve(true); }
             if (threeLoadState === 'ready') return Promise.resolve(true);
-            if (threeLoadState === 'loading') return new Promise(res => { const t = setInterval(() => { if (typeof THREE !== 'undefined') { clearInterval(t); res(true); } }, 100); });
-            threeLoadState = 'loading';
             return new Promise(resolve => {
-                const done = () => resolve(typeof THREE !== 'undefined');
+                threeLoadWaiters.push(resolve);
+                if (threeLoadState === 'loading') return;
+                threeLoadState = 'loading';
+                // Один общий "settle" на onload и onerror: ожидание снимается всегда,
+                // а состояние сбрасывается на idle, чтобы повторная попытка была возможна.
+                const settle = () => {
+                    const ok = typeof THREE !== 'undefined';
+                    const waiters = threeLoadWaiters; threeLoadWaiters = [];
+                    threeLoadState = ok ? 'ready' : 'idle';
+                    waiters.forEach(fn => fn(ok));
+                };
                 const s1 = document.createElement('script');
                 s1.src = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';
                 s1.onload = () => {
                     const s2 = document.createElement('script');
                     s2.src = 'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js';
-                    s2.onload = done; s2.onerror = done;
+                    s2.onload = settle; s2.onerror = settle;
                     document.head.appendChild(s2);
                 };
-                s1.onerror = done;
+                s1.onerror = settle;
                 document.head.appendChild(s1);
             });
         }
@@ -246,7 +255,10 @@
         }
 
         function stopAudio() {
-            if (!audioPlayer.paused) { audioPlayer.pause(); audioPlayer.currentTime = 0; isAudioPlaying = false; document.querySelectorAll('.play-audio-btn').forEach(btn => { btn.innerHTML = 'ПРОСЛУШАТЬ'; }); }
+            if (!audioPlayer.paused) { audioPlayer.pause(); audioPlayer.currentTime = 0; }
+            // флаг сбрасываем всегда: иначе состояние расходится, когда трек уже доиграл
+            isAudioPlaying = false;
+            document.querySelectorAll('.play-audio-btn').forEach(btn => { btn.innerHTML = 'ПРОСЛУШАТЬ'; });
         }
 
         // ---- Приложение ЛУЧ на Android: микрофон открыт постоянно.
@@ -343,7 +355,7 @@
                     const wav = window.__luchTestWav();
                     report.sent = a2.sendAudioBase64(wav) || 'фраза отправлена';
                 } else { report.start = 'нет разрешения на микрофон'; }
-                try { await fetch('/_selftest', { method: 'POST', body: JSON.stringify(report) }); } catch (e) { }
+                try { await apiFetch('/_selftest', { method: 'POST', body: JSON.stringify(report) }); } catch (e) { }
             })();
         };
 
@@ -430,28 +442,44 @@
             const formData = new FormData(); formData.append('file', blob, 's.' + ext);
 
             try {
-                const res = await fetch('/api/voice', { method: 'POST', body: formData }); if (!res.ok) throw new Error('NET FAULT');
-                const data = await res.json();
+                const data = await apiPostForm('/api/voice', formData);
                 if (data.status === 'stop_audio' || data.status === 'ignored') { if(data.status==='stop_audio') stopAudio(); lastUserMsg?.remove(); lastAIMsg?.remove(); lastUserMsg = null; lastAIMsg = null; return; }
                 setText(lastUserMsg, data.user_text); settleMsg(lastAIMsg, data.response); if (data.play_audio) appendPlayButton(lastAIMsg);
             } catch (err) { settleMsg(lastAIMsg, '⚠ ' + err.message); }
             finally { isProcessingAI = false; lastUserMsg = null; lastAIMsg = null; }
         }
 
+        // blob-URL последнего ответа: перед подменой отзываем предыдущий, чтобы WAV не копился за сессию
+        let currentAudioUrl = null;
+        function releaseObjectUrl(url) { if (url) { try { URL.revokeObjectURL(url); } catch (e) {} } }
+        function resetPlayButtons() { document.querySelectorAll('.play-audio-btn').forEach(b => { if (b.dataset.ready) b.innerHTML = '🔊 ОТВЕТ'; }); }
+
         async function appendPlayButton(msgContainer) {
             const holder = msgContainer.querySelector('.body') || msgContainer;
             const btn = document.createElement('button'); btn.className = 'play-audio-btn'; btn.innerHTML = 'DL...'; btn.disabled = true;
             msgContainer.appendChild(document.createElement('br')); holder.appendChild(btn); msgContainer.scrollIntoView({ block: 'nearest' });
             try {
-                const res = await fetch('/api/audio?t=' + Date.now()); if (!res.ok) throw new Error();
-                audioPlayer.src = URL.createObjectURL(await res.blob());
+                const blob = await apiGetBlob('/api/audio?t=' + Date.now());
+                if (currentAudioUrl) { releaseObjectUrl(currentAudioUrl); currentAudioUrl = null; }
+                const url = URL.createObjectURL(blob);   // у каждой кнопки свой URL, а не один общий
+                currentAudioUrl = url;
+                btn.dataset.ready = '1';
                 btn.innerHTML = '🔊 ОТВЕТ'; btn.disabled = false;
+                const markOthers = () => document.querySelectorAll('.play-audio-btn').forEach(b => { if (b !== btn && b.dataset.ready) b.innerHTML = '🔊 ОТВЕТ'; });
                 btn.onclick = () => {
-                    if (!audioPlayer.paused) { audioPlayer.pause(); audioPlayer.currentTime = 0; isAudioPlaying = false; btn.innerHTML = '🔊 ОТВЕТ'; return; }
-                    audioPlayer.currentTime = 0; audioPlayer.play().catch(e=>0); isAudioPlaying = true; btn.innerHTML = '⏸ СТОП';
+                    // если это тот же трек и он играет — ставим на паузу
+                    if (audioPlayer.src === url && !audioPlayer.paused) {
+                        audioPlayer.pause(); audioPlayer.currentTime = 0; isAudioPlaying = false; btn.innerHTML = '🔊 ОТВЕТ'; return;
+                    }
+                    audioPlayer.src = url;   // играем именно эту реплику, а не последнюю загруженную
+                    audioPlayer.currentTime = 0;
+                    markOthers(); btn.innerHTML = '⏸ СТОП';
+                    audioPlayer.play().then(() => { isAudioPlaying = true; }).catch(() => { btn.innerHTML = '🔊 ОТВЕТ'; });
                 };
+                audioPlayer.onended = () => { isAudioPlaying = false; releaseObjectUrl(url); if (currentAudioUrl === url) currentAudioUrl = null; resetPlayButtons(); };
+                audioPlayer.onerror = () => { isAudioPlaying = false; resetPlayButtons(); };
+                audioPlayer.src = url;
                 audioPlayer.play().then(() => { isAudioPlaying = true; btn.innerHTML = '⏸ СТОП'; }).catch(() => 0);
-                audioPlayer.onended = () => { isAudioPlaying = false; document.querySelectorAll('.play-audio-btn').forEach(b => b.innerHTML = '🔊 ОТВЕТ'); };
             } catch (err) { btn.innerHTML = 'ERROR'; }
         }
 
@@ -468,8 +496,7 @@
             if (text.startsWith('/')) {
                 const sysMsg = addMessage(text, 'user'); setCoreState('busy', 'EXEC');
                 try {
-                    const res = await fetch('/api/command', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmd: text }) });
-                    const out = (await res.json()).output;
+                    const out = (await apiPost('/api/command', { cmd: text })).output;
                     addMessage(out, 'system');
                 } catch (err) { addMessage('ERR: ' + err.message, 'system', 'error'); }
                 finally { setCoreState('live', 'READY'); } return;
@@ -478,8 +505,7 @@
             setCoreState('busy', 'THINKING');
             const aiMsg = addMessage('обработка запроса...', 'ai'); aiMsg.classList.add('pending');
             try {
-                const res = await fetch('/api/ask', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
-                const data = await res.json();
+                const data = await apiPost('/api/ask', { text });
                 (data.commands || []).forEach(addAiCommandMsg);
                 settleMsg(aiMsg, data.response); if (data.play_audio) appendPlayButton(aiMsg);
             } catch (err) { settleMsg(aiMsg, 'ERR: ' + err.message); aiMsg.classList.add('error'); } finally { isProcessingAI = false; }
@@ -510,51 +536,70 @@
         const MODE_TAG = { interactive: ['cfg', 'в CONFIG'], danger: ['danger', 'подтвердить'], restart: ['wait', 'перезапуск'] };
 
         const $ = id => document.getElementById(id);
-        function saveToken() { try { localStorage.setItem(TOKEN_KEY, $('cfgToken').value); } catch (e) {} }
+        function saveToken() { try { localStorage.setItem(TOKEN_KEY, $('cfgToken').value); } catch (e) {} tokenWarned = false; }
         function getToken() { try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; } }
 
-        async function apiGet(path) {
-            const headers = {};
+        // единственная точка выхода в сеть: только здесь и делается HTTP-запрос,
+        // поэтому токен гарантированно уходит с каждым обращением к API
+        const TOKEN_MSG = 'Нужен web_token — введи его в поле «web_token» в CONFIG';
+
+        function tokenHeaders(extra) {
+            const headers = Object.assign({}, extra || {});
             const token = getToken();
             if (token) headers['X-Luch-Token'] = token;
-            const res = await fetch(path, { headers });
-            let data = null;
-            try { data = await res.json(); } catch (e) { data = null; }
+            return headers;
+        }
+
+        async function apiFetch(path, opts) {
+            const o = Object.assign({}, opts || {});
+            o.headers = tokenHeaders(o.headers);
+            const res = await fetch(path, o);
             if (res.status === 401) {
-                const err = new Error('Нужен web_token — введи его в поле «web_token» в CONFIG');
+                const err = new Error(TOKEN_MSG);
                 err.needsToken = true;
                 throw err;
             }
+            return res;
+        }
+
+        async function readJson(res) {
+            try { return await res.json(); } catch (e) { return null; }
+        }
+
+        async function apiGet(path) {
+            const res = await apiFetch(path, {});
+            const data = await readJson(res);
             if (!res.ok) throw new Error((data && data.detail) || ('HTTP ' + res.status));
             return data;
         }
 
         async function apiPost(path, body) {
-            const headers = { 'Content-Type': 'application/json' };
-            const token = getToken();
-            if (token) headers['X-Luch-Token'] = token;
-            const res = await fetch(path, { method: 'POST', headers, body: JSON.stringify(body || {}) });
-            let data = null;
-            try { data = await res.json(); } catch (e) { data = null; }
-            if (res.status === 401) {
-                const err = new Error('Нужен web_token — введи его в поле «web_token» в CONFIG');
-                err.needsToken = true;
-                throw err;
-            }
+            const res = await apiFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+            const data = await readJson(res);
             if (!res.ok) throw new Error((data && (data.detail || data.output)) || ('HTTP ' + res.status));
             return data;
         }
 
         async function apiDelete(path) {
-            const headers = {};
-            const token = getToken();
-            if (token) headers['X-Luch-Token'] = token;
-            const res = await fetch(path, { method: 'DELETE', headers });
-            let data = null;
-            try { data = await res.json(); } catch (e) { data = null; }
-            if (res.status === 401) throw new Error('Нужен web_token');
+            const res = await apiFetch(path, { method: 'DELETE' });
+            const data = await readJson(res);
             if (!res.ok) throw new Error((data && data.detail) || ('HTTP ' + res.status));
             return data;
+        }
+
+        // загрузка файла: Content-Type ставит сам браузер, добавляем только токен
+        async function apiPostForm(path, formData) {
+            const res = await apiFetch(path, { method: 'POST', body: formData });
+            const data = await readJson(res);
+            if (!res.ok) throw new Error((data && (data.detail || data.output)) || ('HTTP ' + res.status));
+            return data;
+        }
+
+        // двоичный ответ (аудио): нужен blob, а не JSON
+        async function apiGetBlob(path) {
+            const res = await apiFetch(path, {});
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return await res.blob();
         }
 
         function say(where, text, cls) {
@@ -653,21 +698,14 @@
             $('cfgSub').textContent = p.name + ' · ' + (p.model || '—');
             onProviderChange();
             if (p.kind === 'ollama' && p.models) fillModelList(p.models, p.model);
-            if (activate && !custom) {
-                // встроенные провайдеры переключаются сразу
+            if (activate) {
+                // встроенные провайдеры переключаются по kind, кастомные — по своему id
                 try {
-                    const d = await apiPost('/api/ai/switch', { provider: p.kind });
+                    const d = await apiPost('/api/ai/switch', { provider: custom ? p.id : p.kind });
                     if (d.config) applyConfig(d.config, { keepCard: true });
-                    clearLog('cfgAiLog');
-                    say('cfgAiLog', 'провайдер: ' + (d.config ? d.config.summary : p.name), 'ok');
-                    refreshStateBadge();
-                } catch (e) { say('cfgAiLog', e.message, 'err'); }
-            }
-            if (activate && custom) {
-                try {
-                    const d = await apiPost('/api/ai/switch', { provider: p.id });
-                    if (d.config) applyConfig(d.config, { keepCard: true });
-                    say('cfgAiLog', 'провайдер: ' + p.name, 'ok');
+                    if (!custom) clearLog('cfgAiLog');
+                    const label = custom ? p.name : (d.config ? d.config.summary : p.name);
+                    say('cfgAiLog', 'провайдер: ' + label, 'ok');
                     refreshStateBadge();
                 } catch (e) { say('cfgAiLog', e.message, 'err'); }
             }
@@ -764,10 +802,17 @@
         async function loadConfig() {
             $('cfgToken').value = getToken();
             try {
-                const [cfg, st] = await Promise.all([
-                    fetch('/api/ai/config').then(r => r.json()),
-                    fetch('/api/settings').then(r => r.json())
+                // один упавший запрос не должен ронять всю загрузку CONFIG
+                const [cfgR, stR] = await Promise.allSettled([
+                    apiGet('/api/ai/config'),
+                    apiGet('/api/settings')
                 ]);
+                const cfg = cfgR.status === 'fulfilled' ? cfgR.value : null;
+                const st = stR.status === 'fulfilled' ? stR.value : null;
+                const failed = [cfgR, stR].filter(r => r.status === 'rejected');
+                const tokenErr = failed.find(r => r.reason && r.reason.needsToken);
+                if (tokenErr) say('cfgAiLog', tokenErr.reason.message, 'err');
+                else if (failed.length) say('cfgAiLog', 'не удалось загрузить настройки: ' + failed[0].reason.message, 'err');
                 if (cfg && !cfg.detail) applyConfig(cfg);
                 if (st && st.settings) {
                     const s = st.settings;
@@ -841,8 +886,12 @@
             markBad('cfgBaseUrl', false);
             busy(btn, true);
             try {
+                // POST /api/ai/test принимает {base_url, api_key, model}, но возвращает
+                // только {ok, message} — списка моделей там нет, а новый эндпоинт не вводим.
+                // Поэтому список моделей по-прежнему берём из /api/ai/models (GET),
+                // но через apiGet: запрос обязан уходить с X-Luch-Token.
                 const q = new URLSearchParams({ base_url: url, api_key: $('cfgApiKey').value });
-                const d = await fetch('/api/ai/models?' + q).then(r => r.json());
+                const d = await apiGet('/api/ai/models?' + q);
                 if (d.models && d.models.length) {
                     const dl = $('cfgModelList');
                     dl.innerHTML = '';
@@ -969,7 +1018,7 @@
             if (menuData) { renderMenu(); return; }
             body.textContent = 'загрузка меню…';
             try {
-                const d = await fetch('/api/menu').then(r => r.json());
+                const d = await apiGet('/api/menu');
                 if (d && !d.detail) { menuData = d; renderMenu(); }
                 else body.textContent = d.detail || 'меню недоступно';
             } catch (e) { body.textContent = 'ошибка: ' + e.message; }
@@ -1070,12 +1119,20 @@
         // ─────────── AI CMD: команды ИИ, их аргументы и вывод ───────────
         let aiCmds = [];        // [{name, icon, desc, example, args:[{name,required,default,type}], danger}]
         let aiPending = null;   // имя опасной команды, ждущей второго клика
-        const aiRows = {};      // name -> {el, inputs:{}}
+        const aiRows = {};      // name -> {el, inputs:{}, sig}  (сбрасывается на каждой перерисовке)
         const aiLog = [];       // [{time, command, args, status, output, elapsed}]
+
+        function aiCmdSignature(c) {
+            return JSON.stringify([c.name, c.icon, c.desc, c.example, c.danger, c.args || []]);
+        }
 
         function renderAiCommands() {
             const body = $('aiBody');
             if (!body) return;
+            // сохраняем уже отрисованные строки: если команда не изменилась — переиспользуем
+            // её DOM вместе с введёнными аргументами и раскрытым состоянием
+            const prevRows = Object.assign({}, aiRows);
+            Object.keys(aiRows).forEach(k => delete aiRows[k]);
             body.textContent = '';
             if (!aiCmds.length) {
                 body.appendChild(Object.assign(document.createElement('div'),
@@ -1088,6 +1145,13 @@
             body.appendChild(head);
 
             aiCmds.forEach(c => {
+                const sig = aiCmdSignature(c);
+                const reuse = prevRows[c.name];
+                if (reuse && reuse.sig === sig && reuse.el) {
+                    aiRows[c.name] = reuse;      // команда та же — состояние ввода не трогаем
+                    body.appendChild(reuse.el);
+                    return;
+                }
                 const row = document.createElement('div'); row.className = 'ai-row';
 
                 const top = document.createElement('button');
@@ -1158,7 +1222,7 @@
 
                 row.appendChild(top); row.appendChild(form);
                 body.appendChild(row);
-                aiRows[c.name] = { el: row, inputs };
+                aiRows[c.name] = { el: row, inputs, sig };
             });
 
             const hint = document.createElement('div');
@@ -1175,7 +1239,9 @@
                 const d = await apiGet('/api/ai/commands');
                 const firstLoad = !aiCmds.length;
                 aiCmds = d.commands || [];
-                if (firstLoad) renderAiCommands();
+                // force — обновляем разметку, но renderAiCommands переиспользует
+                // неизменившиеся строки, поэтому введённые аргументы не теряются
+                if (firstLoad || force) renderAiCommands();
                 if (d.history) {
                     aiLog.length = 0;
                     (d.history || []).slice(-30).forEach(h => aiLog.push(h));
@@ -1311,8 +1377,8 @@
         // показать активного провайдера и модель в статус-баре
         function refreshStateBadge() {
             const el = $('sbModel');
-            if (!el) return;
-            fetch('/api/ai/config').then(r => r.json()).then(c => {
+            if (!el) return Promise.resolve();
+            return apiGet('/api/ai/config').then(c => {
                 if (!c || c.detail) return;
                 el.textContent = c.summary || `${c.provider} ${c.active_model || '—'}`;
                 el.title = `Провайдер: ${c.provider_label}\nМодель: ${c.active_model}\nАдрес: ${c.base_url || '—'}`;
@@ -1333,7 +1399,7 @@
 
         // подтягиваем реальные команды меню для Tab-подсказок
         function loadMenuHints() {
-            fetch('/api/menu').then(r => r.json()).then(d => {
+            apiGet('/api/menu').then(d => {
                 if (!d || d.detail) return;
                 menuData = menuData || d;
                 addCmdHints((d.groups || []).flatMap(g => g.items.map(i => '/' + i.name)));
@@ -1345,6 +1411,7 @@
         let idTimeT = null; const S_SLEEP_DELAY = 5000; let showCore = false;
         let SCE, CM, RDR, CTROLS, UNI_GRP, UPDATERS = [], sysFrame = null; 
         let engineInst = false;
+        let holoResizeBound = false;   // resize-обработчик 3D вешаем только один раз
         
         const CLRS = {
             Cyantific: 0x00f3ff, // Научный ярко-лазурный 
@@ -1425,7 +1492,10 @@
             CTROLS = new THREE.OrbitControls(CM, RDR.domElement);
             CTROLS.enableDamping = true; CTROLS.dampingFactor = 0.035; CTROLS.enablePan = false;
             CTROLS.minDistance = 6; CTROLS.maxDistance = 60;
-            window.addEventListener('resize', () => { if(CM) { CM.aspect=window.innerWidth/window.innerHeight; CM.updateProjectionMatrix(); RDR.setSize(window.innerWidth,window.innerHeight); } });
+            if (!holoResizeBound) {
+                holoResizeBound = true;
+                window.addEventListener('resize', () => { if(CM) { CM.aspect=window.innerWidth/window.innerHeight; CM.updateProjectionMatrix(); RDR.setSize(window.innerWidth,window.innerHeight); } });
+            }
 
             UNI_GRP = new THREE.Group(); SCE.add(UNI_GRP);
             UPDATERS = [];
@@ -1595,29 +1665,61 @@
             if (RDR && SCE && CM) RDR.render(SCE, CM);
         }
 
-        // --- 3. BACKGROUND NETWORK PINGS (Для Таймеров Сервера Консоли) --- 
-        setInterval(async () => {
-            try {
-                const rqs = await fetch('/api/alerts'); if(!rqs.ok) return;
-                const payl = await rqs.json();
-                if (payl.alerts?.length > 0) {
-                    payl.alerts.forEach(async (alItem) => {
-                        let sysTbx = addMessage('💠 INCOMING DATALINK: ' + alItem.description, 'ai');
-                        sysTbx.style.borderColor = "var(--neon-pink)"; sysTbx.style.boxShadow = "var(--shadow-glow-pink)";
-                        try {
-                            const bbb = await (await fetch('/api/alert_audio?t=' + Date.now())).blob();
-                            let wpAud = new Audio(URL.createObjectURL(bbb));
-                            wpAud.play().catch(()=>{
-                                let bcBt = document.createElement('button'); bcBt.className = 'play-audio-btn';
-                                bcBt.style.color = "var(--neon-pink)"; bcBt.style.borderColor="var(--neon-pink)";
-                                bcBt.innerHTML = '🔊 ACTIVATE LINK SIGNAL'; bcBt.onclick = ()=>wpAud.play();
-                                sysTbx.appendChild(document.createElement('br')); sysTbx.appendChild(bcBt);
-                            });
-                        } catch (er) {}
-                    });
+        // --- ЕДИНЫЙ РЕЕСТР ОПРОСОВ: не даём запросам наслаиваться и молчим на скрытой вкладке ---
+        const pollers = [];
+        let alertAudioEl = null, alertAudioUrl = null;
+        let tokenWarned = false;   // «нужен токен» для фоновых опросов показываем один раз
+
+        function warnTokenOnce() {
+            if (tokenWarned) return;
+            tokenWarned = true;
+            try { addMessage(TOKEN_MSG, 'system', 'error'); } catch (e) {}
+        }
+
+        function registerPoll(name, ms, fn) {
+            const p = { name, ms, tick: null, timer: null, running: false };
+            p.tick = async () => {
+                if (document.hidden || p.running) return;   // вкладка скрыта или прошлый запрос ещё в полёте
+                p.running = true;
+                try { await fn(); } catch (e) {
+                    if (e && e.needsToken) warnTokenOnce();
                 }
-            } catch(e) {}
-        }, 2500); 
+                finally { p.running = false; }
+            };
+            p.timer = setInterval(p.tick, ms);
+            pollers.push(p);
+            return p;
+        }
+        function stopPolls() { pollers.forEach(p => { if (p.timer) { clearInterval(p.timer); p.timer = null; } }); }
+        window.addEventListener('pagehide', stopPolls);
+        window.addEventListener('beforeunload', stopPolls);
+
+        // --- 3. BACKGROUND NETWORK PINGS (Для Таймеров Сервера Консоли) ---
+        registerPoll('alerts', 2500, async () => {
+            const payl = await apiGet('/api/alerts');
+            if (!payl || !(payl.alerts?.length > 0)) return;
+            payl.alerts.forEach(async (alItem) => {
+                let sysTbx = addMessage('💠 INCOMING DATALINK: ' + alItem.description, 'ai');
+                sysTbx.style.borderColor = "var(--neon-pink)"; sysTbx.style.boxShadow = "var(--shadow-glow-pink)";
+                try {
+                    const bbb = await apiGetBlob('/api/alert_audio?t=' + Date.now());
+                    // один Audio на все алерты: подменяем только src, а не создаём объект заново
+                    if (!alertAudioEl) alertAudioEl = new Audio();
+                    releaseObjectUrl(alertAudioUrl);
+                    const aUrl = URL.createObjectURL(bbb);
+                    alertAudioUrl = aUrl;
+                    alertAudioEl.onended = () => { releaseObjectUrl(aUrl); if (alertAudioUrl === aUrl) alertAudioUrl = null; };
+                    alertAudioEl.onerror = () => { releaseObjectUrl(aUrl); if (alertAudioUrl === aUrl) alertAudioUrl = null; };
+                    alertAudioEl.src = aUrl;
+                    alertAudioEl.play().catch(() => {
+                        let bcBt = document.createElement('button'); bcBt.className = 'play-audio-btn';
+                        bcBt.style.color = "var(--neon-pink)"; bcBt.style.borderColor="var(--neon-pink)";
+                        bcBt.innerHTML = '🔊 ACTIVATE LINK SIGNAL'; bcBt.onclick = () => alertAudioEl.play();
+                        sysTbx.appendChild(document.createElement('br')); sysTbx.appendChild(bcBt);
+                    });
+                } catch (er) {}
+            });
+        });
 
 
         // --- 4. ГЕОЛОКАЦИЯ / НАВИГАТОР (Leaflet + OpenStreetMap) ---
@@ -1696,35 +1798,28 @@
             // Если ИИ запрашивал свежую позицию — погасили запрос после первой отправки
             if (locRequestPending) {
                 locRequestPending = false;
-                fetch('/api/location/request/resolve', { method: 'POST' }).catch(()=>{});
+                apiPost('/api/location/request/resolve', {}).catch(()=>{});
             }
         }
 
         // ИИ может запросить координаты клиента (команда request_location) —
         // проверяем флаг на сервере и при необходимости включаем геолокацию
         let locRequestPending = false;
-        setInterval(async () => {
-            try {
-                const r = await fetch('/api/location/request');
-                const d = await r.json();
-                if (d && d.pending) {
-                    locRequestPending = true;
-                    lastSentPos = null;                    // снять «тюльпан» срочности
-                    if (geoWatchId === null) startGeolocation();
-                }
-            } catch (e) { /* сервер недоступен */ }
-        }, 3000);
+        registerPoll('location-request', 3000, async () => {
+            const d = await apiGet('/api/location/request');
+            if (d && d.pending) {
+                locRequestPending = true;
+                lastSentPos = null;                    // снять «тюльпан» срочности
+                if (geoWatchId === null) startGeolocation();
+            }
+        });
 
         // Отправляем координаты на сервер (не чаще раза в 8 сек)
         function sendGeolocationToServer(lat, lng, accuracy) {
             const now = Date.now();
             if (lastSentPos && (now - lastSentPos) < 8000) return;
             lastSentPos = now;
-            fetch('/api/location', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ lat, lng, accuracy, source: 'browser' })
-            }).catch(()=>{});
+            apiPost('/api/location', { lat, lng, accuracy, source: 'browser' }).catch(()=>{});
         }
 
         function onGeoError(err) {
@@ -1791,11 +1886,7 @@
             if (!dest) { setMapStatus('Укажи, куда едем (адрес или фраза)', false); return; }
             if (!map) initMap();
             try {
-                const res = await fetch('/api/navigator/start', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ destination: dest })
-                });
-                const d = await res.json();
+                const d = await apiPost('/api/navigator/start', { destination: dest });
                 const route = d && d.data;
                 if (!route || route.status !== 'navigation_started') {
                     setMapStatus('Не удалось построить маршрут: ' + ((route && route.message) || 'неизвестная ошибка'), false);
@@ -1828,7 +1919,7 @@
 
         async function stopNavMode() {
             try {
-                await fetch('/api/navigator/stop', { method: 'POST' });
+                await apiPost('/api/navigator/stop', {});
             } catch (e) { /* сервер может быть недоступен */ }
             setNavModeUI(false);
             showManeuver(null);
@@ -1836,22 +1927,19 @@
         }
 
         // Опрос состояния навигатора: обновляем баннер манёвра и позицию
-        setInterval(async () => {
+        registerPoll('navigator', 2000, async () => {
             if (!navMode) return;
-            try {
-                const res = await fetch('/api/navigator/status');
-                const d = await res.json();
-                if (!d || !d.active) { setNavModeUI(false); showManeuver(null); return; }
-                if (d.next_maneuver) showManeuver(d.next_maneuver);
-                if (d.current_location && d.current_location.lat != null && lastKnownPos) {
-                    const mlat = d.current_location.lat, mlng = d.current_location.lng;
-                    const gps = lastKnownPos;
-                    if (Math.abs(mlat - gps.lat) > 0.000001 || Math.abs(mlng - gps.lng) > 0.000001) {
-                        updateMarker({ lat: mlat, lng: mlng, accuracy: gps.accuracy, source: 'server' });
-                    }
+            const d = await apiGet('/api/navigator/status');
+            if (!d || !d.active) { setNavModeUI(false); showManeuver(null); return; }
+            if (d.next_maneuver) showManeuver(d.next_maneuver);
+            if (d.current_location && d.current_location.lat != null && lastKnownPos) {
+                const mlat = d.current_location.lat, mlng = d.current_location.lng;
+                const gps = lastKnownPos;
+                if (Math.abs(mlat - gps.lat) > 0.000001 || Math.abs(mlng - gps.lng) > 0.000001) {
+                    updateMarker({ lat: mlat, lng: mlng, accuracy: gps.accuracy, source: 'server' });
                 }
-            } catch (e) { /* сервер недоступен */ }
-        }, 2000);
+            }
+        });
         
 
         // --- 5. АКТИВНОСТЬ ЛУЧА НА 3D-ЯДРЕ (по состоянию с сервера) ---
@@ -1910,27 +1998,23 @@
             });
         }
 
-        // Опрос состояния LУЧА с сервера (раз в секунду)
-        setInterval(async () => {
-            try {
-                const r = await fetch('/api/state');
-                const d = await r.json();
-                if (d && d.state) applyAIState(d.state);
-            } catch (e) { /* сервер может быть недоступен */ }
-        }, 1000);
+        // Опрос состояния ЛУЧА с сервера (раз в 2 с, с защитой от наслоения запросов)
+        registerPoll('state', 2000, async () => {
+            const d = await apiGet('/api/state');
+            if (d && d.state) applyAIState(d.state);
+        });
 
-        setInterval(refreshStateBadge, 5000);
+        registerPoll('config-badge', 5000, refreshStateBadge);
 
         // пока панель AI CMD открыта — подтягиваем команды, которые выполнил агент в консоли
-        setInterval(() => {
+        registerPoll('ai-history', 3000, async () => {
             if (openPanel !== 'ai') return;
-            apiGet('/api/ai/commands').then(d => {
-                const hist = d.history || [];
-                if (hist.length === aiLog.length && hist.length
-                    && hist[hist.length - 1].seq === aiLog[aiLog.length - 1].seq) return;
-                aiLog.length = 0; hist.slice(-30).forEach(h => aiLog.push(h));
-                renderAiLog();
-                $('aiSub').textContent = `${aiCmds.length} команд(ы), ${aiLog.length} в журнале`;
-            }).catch(() => {});
-        }, 3000);
+            const d = await apiGet('/api/ai/commands');
+            const hist = d.history || [];
+            if (hist.length === aiLog.length && hist.length
+                && hist[hist.length - 1].seq === aiLog[aiLog.length - 1].seq) return;
+            aiLog.length = 0; hist.slice(-30).forEach(h => aiLog.push(h));
+            renderAiLog();
+            $('aiSub').textContent = `${aiCmds.length} команд(ы), ${aiLog.length} в журнале`;
+        });
 
