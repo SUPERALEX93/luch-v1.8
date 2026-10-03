@@ -10,8 +10,8 @@ android {
         applicationId = "proekt.luch.app"
         minSdk = 26            // Android 8.0 — ниже нет нормальных каналов уведомлений
         targetSdk = 34
-        versionCode = 8
-        versionName = "1.7"
+        versionCode = 9
+        versionName = "1.8"
     }
 
     buildFeatures {

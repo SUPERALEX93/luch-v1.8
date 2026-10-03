@@ -1,0 +1,12 @@
+# Скопируйте этот файл в local.properties и поправьте путь под свою машину.
+#
+#   cp local.properties.example local.properties
+#
+# local.properties не хранится в git: путь к Android SDK уникален для каждой машины.
+#
+# Нужны:
+#   - Android SDK с платформой android-36 и build-tools 36.0.0
+#   - JDK 21 (JDK 26 не умеет собирать jlink-образ для Android; путь к нему
+#     задаётся в gradle.properties -> org.gradle.java.home)
+
+sdk.dir=/opt/android-sdk
