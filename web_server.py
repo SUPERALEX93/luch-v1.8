@@ -8,13 +8,14 @@ import threading
 import time
 from pathlib import Path
 import re
-from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Body
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File, Body, Header
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi import Response
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
+from urllib.parse import urlparse
 import uvicorn
 import settings
 import work_fuctions
@@ -24,48 +25,116 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = BASE_DIR / "index.html"
 
-app = FastAPI()
+# Автодокументация FastAPI (Swagger/OpenAPI) выключена: она раскрывает полную
+# карту API без токена, а нам нужен только явный контракт ниже.
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
+# CORS без «*»: UI живёт на том же origin, ему кросс-домен не нужен. Список
+# источников задаётся окружением LUCH_CORS_ORIGINS через запятую (по умолчанию
+# пусто = никаких кросс-доменных запросов). Android — не браузер, CORS игнорирует.
+_cors_raw = os.environ.get("LUCH_CORS_ORIGINS", "") or ""
+CORS_ORIGINS = [o.strip() for o in _cors_raw.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Luch-Token"],
 )
 
+# --- Кэши: версия сборки и готовый app.js (пересчёт только при изменениях) ---
+_build_version_lock = threading.Lock()
+_build_version_cache = {"mtime": None, "value": None}
+_app_js_lock = threading.Lock()
+_app_js_cache = {"key": None, "body": None}
+
+BUILD_GRADLE = BASE_DIR / "android" / "app" / "build.gradle.kts"
+
+
 def app_build_version() -> str:
-    """Версия приложения из build.gradle.kts — страница сообщает её мосту."""
+    """Версия приложения из build.gradle.kts — страница сообщает её мосту.
+
+    Файл читается один раз: значение кэшируется и пересчитывается только при
+    изменении mtime, а не на каждом запросе app.js.
+    """
     try:
-        txt = (BASE_DIR / "android" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
-        m = re.search(r'versionName\s*=\s*"([^"]+)"', txt)
-        return m.group(1) if m else "?"
-    except Exception:
+        mtime = BUILD_GRADLE.stat().st_mtime_ns
+    except OSError:
+        with _build_version_lock:
+            _build_version_cache["mtime"] = None
+            _build_version_cache["value"] = "?"
         return "?"
+    with _build_version_lock:
+        if _build_version_cache["mtime"] == mtime and _build_version_cache["value"] is not None:
+            return _build_version_cache["value"]
+    try:
+        txt = BUILD_GRADLE.read_text(encoding="utf-8")
+        m = re.search(r'versionName\s*=\s*"([^"]+)"', txt)
+        value = m.group(1) if m else "?"
+    except Exception:
+        value = "?"
+    with _build_version_lock:
+        _build_version_cache["mtime"] = mtime
+        _build_version_cache["value"] = value
+    return value
+
+
+def _render_app_js(full_path, stat_result) -> bytes:
+    """app.js с подставленной версией сборки. Кэш по ключу (mtime, size, version)."""
+    try:
+        mtime, size = stat_result.st_mtime_ns, stat_result.st_size
+    except Exception:
+        st = os.stat(full_path)
+        mtime, size = st.st_mtime_ns, st.st_size
+    version = app_build_version()
+    key = (mtime, size, version)
+    with _app_js_lock:
+        if _app_js_cache["key"] == key and _app_js_cache["body"] is not None:
+            return _app_js_cache["body"]
+    text = Path(full_path).read_text(encoding="utf-8")
+    body = text.replace("__BUILD__", version).encode("utf-8")
+    with _app_js_lock:
+        _app_js_cache["key"] = key
+        _app_js_cache["body"] = body
+    return body
 
 
 class NoCacheStatic(StaticFiles):
-    """Страница всегда свежая: старый app.js в кэше WebView выглядел как
-    «ничего не изменилось»."""
+    """app.js и html всегда свежие: старый app.js в кэше WebView выглядел как
+    «ничего не изменилось». Остальным файлам (css, картинки, шрифты) разрешено
+    короткое кэширование — Starlette отдаёт их с ETag и Last-Modified."""
 
     NO_CACHE = "no-store, no-cache, must-revalidate, max-age=0"
+    SHORT_CACHE = "public, max-age=300"
 
     def file_response(self, full_path, stat_result, scope, status_code=200):
-        hdr = {"Cache-Control": self.NO_CACHE, "Pragma": "no-cache"}
-        if str(full_path).endswith("app.js"):
-            try:
-                text = Path(full_path).read_text(encoding="utf-8")
-                text = text.replace("__BUILD__", app_build_version())
-                return Response(text, media_type="application/javascript", headers=hdr)
-            except Exception:
-                pass
+        name = str(full_path).lower()
+        if name.endswith("app.js") or name.endswith(".html"):
+            hdr = {"Cache-Control": self.NO_CACHE, "Pragma": "no-cache"}
+            if name.endswith("app.js"):
+                try:
+                    return Response(_render_app_js(full_path, stat_result),
+                                    media_type="application/javascript", headers=hdr)
+                except Exception:
+                    pass
+            resp = super().file_response(full_path, stat_result, scope, status_code)
+            resp.headers["Cache-Control"] = self.NO_CACHE
+            resp.headers["Pragma"] = "no-cache"
+            return resp
         resp = super().file_response(full_path, stat_result, scope, status_code)
-        resp.headers["Cache-Control"] = self.NO_CACHE
-        resp.headers["Pragma"] = "no-cache"
+        try:
+            resp.headers["Cache-Control"] = self.SHORT_CACHE
+        except Exception:
+            pass
         return resp
 
 
 app.mount("/static", NoCacheStatic(directory=str(STATIC_DIR), check_dir=False), name="static")
+
+@app.get("/api/health")
+def health():
+    """Публичная проверка живости: никаких секретов, IP и данных об устройстве."""
+    return {"status": "ok", "version": app_build_version()}
 
 ai_instance = None
 server_instance = None
@@ -131,23 +200,119 @@ class RunCommandModel(BaseModel):
     confirm: bool = False
 
 
-def _require_web_token(token: str | None):
-    """Защита изменяющих запросов, если в настройках задан web_token.
+# =============== Проверка web_token ===============
+# Публичны: корень, /static, /api/health и точки, которые аутентифицируются
+# токеном УСТРОЙСТВА (client_id + token), а не web_token. Всё остальное под
+# /api/* и /_selftest закрыто middleware ниже.
+PUBLIC_API_PATHS = {
+    "/api/health",
+    "/api/device/register",
+    "/api/device/queue",
+    "/api/device/result",
+    "/api/device/ping",
+    "/api/device/location",
+    # /api/voice сам проверяет доступ: либо токен устройства (телефон не знает
+    # web_token), либо токен веб-панели. Поэтому на уровне middleware он открыт,
+    # а решение принимается внутри ручки.
+    "/api/voice",
+}
 
-    Пустой токен = проверки нет (обратная совместимость).
+
+def _is_public_path(path: str) -> bool:
+    if path in ("/", "/api/health"):
+        return True
+    if path == "/static" or path.startswith("/static/"):
+        return True
+    # Учитываем возможный слеш в конце (/api/device/ping/), иначе FastAPI-редирект
+    # на 307 отсекался бы middleware как «защищённый».
+    return path in PUBLIC_API_PATHS or path.rstrip("/") in PUBLIC_API_PATHS
+
+
+def _require_web_token(token):
+    """Проверить токен веб-панели из заголовка X-Luch-Token.
+
+    Пустой web_token — это НЕ «проверки нет», а ошибка конфигурации: без токена
+    панель осталась бы открытой всем, поэтому закрываемся (fail closed, 500).
     """
     expected = (settings.settings.get("web_token") or "").strip()
     if not expected:
-        return
+        raise HTTPException(status_code=500,
+                            detail="web_token не задан в настройках — без него веб-панель "
+                                   "была бы открыта всем. Задай web_token и перезапусти сервер.")
     if not expected.isascii():
         raise HTTPException(status_code=500,
                             detail="web_token содержит нелатинские символы — такие нельзя передать "
                                    "в HTTP-заголовке. Замени его на латиницу.")
-    if not token or not hmac.compare_digest(str(token), expected):
-        raise HTTPException(status_code=401, detail="Нужен верный web_token (заголовок X-Luch-Token)")
+    supplied = "" if token is None else str(token)
+    # Сравниваем БАЙТЫ: hmac.compare_digest со str падает TypeError на не-ASCII
+    # клиентском токене и превращал бы 401 в 500.
+    if not supplied or not hmac.compare_digest(supplied.encode("utf-8"),
+                                               expected.encode("utf-8")):
+        raise HTTPException(status_code=401,
+                            detail="Нужен верный web_token (заголовок X-Luch-Token)")
+
+
+@app.middleware("http")
+async def _web_token_middleware(request, call_next):
+    """Единая защита /api/* и /_selftest: проверка в одном месте, а не в каждой ручке."""
+    path = request.url.path
+    # Предполётный CORS-запрос (OPTIONS) не несёт токена — пропускаем его к CORS.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    guarded = path == "/_selftest" or (path.startswith("/api/") and not _is_public_path(path))
+    if guarded:
+        try:
+            _require_web_token(request.headers.get("X-Luch-Token"))
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    return await call_next(request)
+
+
+def _log_web_error(where: str, exc: Exception):
+    """Настоящую ошибку пишем в журнал, наружу отдаём общее сообщение."""
+    try:
+        work_fuctions.log_event("web_error", f"{where}: {type(exc).__name__}: {exc}")
+    except Exception:
+        print(f"[web_error] {where}: {exc}", flush=True)
+
+
+def _validate_base_url(url: str) -> str:
+    """Проверка адреса API перед запросом: только http/https и не служебные цели.
+
+    Локальные и приватные адреса разрешены — пользователь держит LLM на
+    127.0.0.1/localhost или в своей LAN. Запрещены адрес метаданных облака и
+    весь link-local диапазон 169.254.0.0/16.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="не указан адрес API (base_url)")
+    try:
+        parsed = urlparse(raw)
+        scheme = (parsed.scheme or "").lower()
+        host = (parsed.hostname or "").strip().strip("[]").lower()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="некорректный адрес API (base_url)")
+    if scheme not in ("http", "https"):
+        raise HTTPException(status_code=400,
+                            detail="адрес API должен начинаться с http:// или https://")
+    if not host:
+        raise HTTPException(status_code=400, detail="в адресе API не указан хост")
+    if host == "169.254.169.254" or host.startswith("169.254."):
+        raise HTTPException(status_code=400,
+                            detail="адреса из служебного диапазона 169.254.0.0/16 запрещены")
+    return raw
+
+
+_local_ip_lock = threading.Lock()
+_local_ip_cache = {"ip": None, "ts": 0.0}
 
 
 def get_local_ip():
+    """LAN-адрес машины. Кэш ~10 секунд: сокет на каждый запрос не нужен."""
+    now = time.time()
+    with _local_ip_lock:
+        if _local_ip_cache["ip"] and (now - _local_ip_cache["ts"]) < 10.0:
+            return _local_ip_cache["ip"]
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('10.255.255.255', 1))
@@ -156,6 +321,9 @@ def get_local_ip():
         IP = '127.0.0.1'
     finally:
         s.close()
+    with _local_ip_lock:
+        _local_ip_cache["ip"] = IP
+        _local_ip_cache["ts"] = now
     return IP
 
 @app.get("/")
@@ -189,16 +357,34 @@ def ask_ai(data: QueryModel):
     }
 
 @app.post("/api/command")
-def execute_command(data: CommandModel, x_luch_token: str | None = Header(default=None)):
+def execute_command(data: CommandModel):
     global ai_instance
     if not ai_instance:
         raise HTTPException(status_code=500, detail="AI не инициализирован")
-    _require_web_token(x_luch_token)
+    cmd = (data.cmd or "").strip()
+    if not cmd:
+        return JSONResponse({"status": "error", "detail": "Пустая команда",
+                             "output": "Пустая команда"}, status_code=400)
     try:
-        result = ai_instance.process_command(data.cmd)
-        return {"status": "ok", "output": result}
+        result = ai_instance.process_command(cmd)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "detail": str(e), "output": str(e)},
+                            status_code=400)
     except Exception as e:
-        return {"status": "error", "output": str(e)}
+        _log_web_error("/api/command", e)
+        msg = "Не удалось выполнить команду"
+        return JSONResponse({"status": "error", "detail": msg, "output": msg}, status_code=500)
+    # process_command возвращает строку-статус, а не бросает исключение.
+    if isinstance(result, str):
+        upper = result.strip().upper()
+        if upper == "UNKNOWN COMMAND":
+            msg = f"Неизвестная команда: {cmd}"
+            return JSONResponse({"status": "error", "detail": msg, "output": msg}, status_code=400)
+        if upper.startswith("ERROR:"):
+            _log_web_error("/api/command", RuntimeError(result))
+            msg = "Команда завершилась с ошибкой"
+            return JSONResponse({"status": "error", "detail": msg, "output": msg}, status_code=500)
+    return {"status": "ok", "output": result}
 
 
 # =============== Настройка провайдера ИИ ===============
@@ -221,11 +407,10 @@ def get_ai_commands():
 
 
 @app.post("/api/ai/commands/run")
-def run_ai_command(data: AICommandRunModel, x_luch_token: str | None = Header(default=None)):
+def run_ai_command(data: AICommandRunModel):
     """Выполнить команду ИИ с сайта и вернуть её вывод."""
     if not ai_instance:
         raise HTTPException(status_code=500, detail="AI не инициализирован")
-    _require_web_token(x_luch_token)
     try:
         return ai_instance.web_run_ai_command(
             data.command, data.args, data.confirm,
@@ -234,25 +419,24 @@ def run_ai_command(data: AICommandRunModel, x_luch_token: str | None = Header(de
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"не удалось выполнить: {e}")
+        _log_web_error("/api/ai/commands/run", e)
+        raise HTTPException(status_code=500, detail="не удалось выполнить команду")
 
 
 @app.post("/api/ai/commands/clear")
-def clear_ai_command_history(x_luch_token: str | None = Header(default=None)):
+def clear_ai_command_history():
     """Очистить журнал выполнения ИИ-команд."""
     if not ai_instance:
         raise HTTPException(status_code=500, detail="AI не инициализирован")
-    _require_web_token(x_luch_token)
     ai_instance.web_clear_ai_command_history()
     return {"status": "ok"}
 
 
 @app.post("/api/ai/config")
-def set_ai_config(data: AIConfigModel, x_luch_token: str | None = Header(default=None)):
+def set_ai_config(data: AIConfigModel):
     """Сохранить кастомного провайдера (адрес/ключ/модель) и, если надо, переключиться на него."""
     if not ai_instance:
         raise HTTPException(status_code=500, detail="AI не инициализирован")
-    _require_web_token(x_luch_token)
     if not data.base_url.strip():
         raise HTTPException(status_code=400, detail="не указан адрес API (base_url)")
     try:
@@ -270,60 +454,60 @@ def set_ai_config(data: AIConfigModel, x_luch_token: str | None = Header(default
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"не удалось сохранить: {e}")
+        _log_web_error("/api/ai/config", e)
+        raise HTTPException(status_code=500, detail="не удалось сохранить конфигурацию ИИ")
 
 
 @app.post("/api/ai/switch")
-def switch_ai_provider(data: AIProviderSwitchModel, x_luch_token: str | None = Header(default=None)):
+def switch_ai_provider(data: AIProviderSwitchModel):
     """Переключиться на ollama, zen или сохранённого кастомного провайдера."""
     if not ai_instance:
         raise HTTPException(status_code=500, detail="AI не инициализирован")
-    _require_web_token(x_luch_token)
     try:
         ai_instance.web_switch_provider(data.provider)
         return {"status": "ok", "config": ai_instance.ai_config()}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"не удалось переключить: {e}")
+        _log_web_error("/api/ai/switch", e)
+        raise HTTPException(status_code=500, detail="не удалось переключить провайдера")
 
 
 @app.post("/api/ai/zen")
-def set_ai_zen_key(data: AIZenKeyModel, x_luch_token: str | None = Header(default=None)):
+def set_ai_zen_key(data: AIZenKeyModel):
     """Сохранить API-ключ и модель OpenCode Zen."""
     if not ai_instance:
         raise HTTPException(status_code=500, detail="AI не инициализирован")
-    _require_web_token(x_luch_token)
     try:
         ai_instance.web_set_zen_key(data.api_key, data.model or None)
         return {"status": "ok", "config": ai_instance.ai_config()}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"не удалось сохранить: {e}")
+        _log_web_error("/api/ai/zen", e)
+        raise HTTPException(status_code=500, detail="не удалось сохранить ключ Zen")
 
 
 @app.post("/api/ai/ollama")
-def set_ai_ollama_model(data: AIOllamaModelModel, x_luch_token: str | None = Header(default=None)):
+def set_ai_ollama_model(data: AIOllamaModelModel):
     """Сохранить модель Ollama с сайта."""
     if not ai_instance:
         raise HTTPException(status_code=500, detail="AI не инициализирован")
-    _require_web_token(x_luch_token)
     try:
         ai_instance.web_set_ollama_model(data.model)
         return {"status": "ok", "config": ai_instance.ai_config()}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"не удалось сохранить: {e}")
+        _log_web_error("/api/ai/ollama", e)
+        raise HTTPException(status_code=500, detail="не удалось сохранить модель Ollama")
 
 
 @app.delete("/api/ai/provider")
-def delete_ai_provider(provider_id: str, x_luch_token: str | None = Header(default=None)):
+def delete_ai_provider(provider_id: str):
     """Удалить кастомного провайдера из списка."""
     if not ai_instance:
         raise HTTPException(status_code=500, detail="AI не инициализирован")
-    _require_web_token(x_luch_token)
     try:
         removed = ai_instance.web_delete_custom_provider(provider_id)
         return {"status": "ok", "removed": removed, "config": ai_instance.ai_config()}
@@ -336,6 +520,9 @@ def get_ai_models(base_url: str = "", api_key: str = ""):
     """Список моделей с адреса. Не у всех серверов есть /models — тогда впиши имя вручную."""
     if not ai_instance:
         raise HTTPException(status_code=500, detail="AI не инициализирован")
+    # Адрес приходит от клиента и уходит в requests — проверяем против SSRF.
+    if base_url.strip():
+        base_url = _validate_base_url(base_url)
     # пустая api_key = «оставь сохранённую», но только если адрес не меняли
     if not api_key.strip() and not base_url.strip():
         models, err = ai_instance.list_ai_models()
@@ -349,11 +536,13 @@ def get_ai_models(base_url: str = "", api_key: str = ""):
 
 
 @app.post("/api/ai/test")
-def test_ai_endpoint(data: AIProbeModel, x_luch_token: str | None = Header(default=None)):
+def test_ai_endpoint(data: AIProbeModel):
     """Проверить соединение коротким запросом."""
     if not ai_instance:
         raise HTTPException(status_code=500, detail="AI не инициализирован")
-    _require_web_token(x_luch_token)
+    # Адрес приходит от клиента и уходит в requests — проверяем против SSRF.
+    if data.base_url.strip():
+        data.base_url = _validate_base_url(data.base_url)
     same_address = (ai_instance._normalize_ai_base_url(data.base_url) == ai_instance.ai_base_url
                     if data.base_url.strip() else True)
     key = data.api_key.strip() or (ai_instance.ai_api_key if same_address else "")
@@ -372,17 +561,17 @@ def get_menu():
 
 
 @app.post("/api/menu/run")
-def run_menu_item(data: RunCommandModel, x_luch_token: str | None = Header(default=None)):
+def run_menu_item(data: RunCommandModel):
     """Выполнить пункт меню из браузера. Интерактивные пункты отклоняются."""
     if not ai_instance:
         raise HTTPException(status_code=500, detail="AI не инициализирован")
-    _require_web_token(x_luch_token)
     try:
         return ai_instance.web_run_command(data.name, confirm=data.confirm)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ошибка выполнения: {e}")
+        _log_web_error("/api/menu/run", e)
+        raise HTTPException(status_code=500, detail="ошибка выполнения команды меню")
 
 
 @app.get("/api/settings")
@@ -394,42 +583,67 @@ def get_settings_public():
 
 
 @app.post("/api/settings")
-def set_setting_public(data: SettingModel, x_luch_token: str | None = Header(default=None)):
+def set_setting_public(data: SettingModel):
     """Горячее изменение одной настройки (голос, скорость, триггер, микрофон, STT)."""
     if not ai_instance:
         raise HTTPException(status_code=500, detail="AI не инициализирован")
-    _require_web_token(x_luch_token)
     try:
         value, warning = ai_instance.web_apply_setting(data.key, data.value)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"не удалось применить: {e}")
+        _log_web_error("/api/settings", e)
+        raise HTTPException(status_code=500, detail="не удалось применить настройку")
     return {"status": "ok", "key": data.key, "value": value, "warning": warning}
 
+# Приватный каталог сервера для временных файлов (не общий /tmp).
+_TMP_DIR = BASE_DIR / "logs" / "tmp"
+# Лимит тела голосового запроса и потолок текста self-test.
+MAX_VOICE_BYTES = 25 * 1024 * 1024
+MAX_SELFTEST_CHARS = 4000
+
+
 def _convert_voice(payload):
-    """Сохранить загруженное аудио и привести к 16 кГц моно. Вызывается в пуле потоков."""
+    """Сохранить загруженное аудио и привести к 16 кГц моно. Вызывается в пуле потоков.
+
+    ffmpeg пишет в УНИКАЛЬНЫЙ файл (общий temp.wav как цель параллельных запросов
+    давал бы мусор), а затем результат атомарно подменяет temp_wav_file, который
+    читает основной процесс. Уникальный файл всегда удаляется в finally.
+    """
     target_wav = settings.PATHS.get("temp_wav_file", str(BASE_DIR / "temp.wav"))
     fd, temp_raw = tempfile.mkstemp(prefix="luch_voice_", suffix=".webm")
     os.close(fd)
     try:
-        with open(temp_raw, "wb") as f:
-            f.write(payload)
+        _TMP_DIR.mkdir(parents=True, exist_ok=True)
+        out_fd, temp_out = tempfile.mkstemp(prefix="luch_voice_", suffix=".wav", dir=str(_TMP_DIR))
+        os.close(out_fd)
         try:
-            proc = subprocess.run([
-                "ffmpeg", "-y", "-i", temp_raw,
-                "-ar", "16000", "-ac", "1", target_wav
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
-        except FileNotFoundError:
-            return False, "ffmpeg не найден в системе"
-        except subprocess.TimeoutExpired:
-            return False, "ffmpeg не ответил за 60 секунд"
-        if proc.returncode != 0:
-            tail = (proc.stderr or b"").decode("utf-8", "ignore").strip().splitlines()
-            return False, f"ffmpeg вернул код {proc.returncode}: {tail[-1] if tail else 'нет вывода'}"
-        if not os.path.exists(target_wav) or os.path.getsize(target_wav) == 0:
-            return False, "не удалось создать WAV-файл"
-        return True, ""
+            with open(temp_raw, "wb") as f:
+                f.write(payload)
+            try:
+                proc = subprocess.run([
+                    "ffmpeg", "-y", "-i", temp_raw,
+                    "-ar", "16000", "-ac", "1", temp_out
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
+            except FileNotFoundError:
+                return False, "ffmpeg не найден в системе"
+            except subprocess.TimeoutExpired:
+                return False, "ffmpeg не ответил за 60 секунд"
+            if proc.returncode != 0:
+                # Декодируем только последнюю строку, а не весь stderr.
+                err_bytes = (proc.stderr or b"").strip()
+                last = err_bytes.splitlines()[-1].decode("utf-8", "ignore") if err_bytes else "нет вывода"
+                return False, f"ffmpeg вернул код {proc.returncode}: {last}"
+            if not os.path.exists(temp_out) or os.path.getsize(temp_out) == 0:
+                return False, "не удалось создать WAV-файл"
+            # Атомарная публикация: основной процесс всегда видит целый файл.
+            os.replace(temp_out, target_wav)
+            return True, ""
+        finally:
+            try:
+                os.unlink(temp_out)
+            except OSError:
+                pass
     finally:
         try:
             os.unlink(temp_raw)
@@ -439,21 +653,47 @@ def _convert_voice(payload):
 
 @app.post("/_selftest")
 async def selftest(report: str = Body(...)):
-    """Отчёт о проверке связи из приложения. Только для установки."""
+    """Отчёт о проверке связи из приложения. Только для установки.
+
+    Токен требуется middleware (это не /api/*, но путь закрыт явно), а размер
+    ограничен, чтобы журнал нельзя было залить произвольным текстом.
+    """
     import datetime
+    if len(report) > MAX_SELFTEST_CHARS:
+        raise HTTPException(status_code=413,
+                            detail=f"отчёт слишком длинный (максимум {MAX_SELFTEST_CHARS} символов)")
     print("[SELFTEST]", datetime.datetime.now().strftime("%H:%M:%S"), report, flush=True)
     return {"ok": True}
 
 
 @app.post("/api/voice")
-async def ask_ai_voice(file: UploadFile = File(...)):
+async def ask_ai_voice(file: UploadFile = File(...),
+                       client_id: str = "",
+                       token: str = "",
+                       x_luch_token: str | None = Header(default=None)):
     global ai_instance
     if not ai_instance:
         raise HTTPException(status_code=500, detail="Экземпляр AI не инициализирован")
 
-    payload = await file.read()
+    # Доступ: либо токен веб-панели (браузер), либо токен УСТРОЙСТВА (телефон).
+    # Android не знает web_token — он аутентифицируется своей парой client_id+token,
+    # той же, что и остальные /api/device/*. Иначе голос с телефона получал бы 401.
+    if not (client_id and token and device_control.check_token(client_id, token)):
+        _require_web_token(x_luch_token)
+
+    # Контент-тип: браузер шлёт audio/webm, приложение — octet-stream.
+    ctype = (file.content_type or "").split(";")[0].strip().lower()
+    allowed = ctype.startswith("audio/") or ctype in ("video/webm", "application/octet-stream")
+    if ctype and not allowed:
+        raise HTTPException(status_code=415, detail="ожидается аудиофайл (audio/*)")
+
+    # Читаем не больше лимита+1 байт: тело не должно уходить в RAM целиком.
+    payload = await file.read(MAX_VOICE_BYTES + 1)
     if not payload:
         raise HTTPException(status_code=400, detail="Пустой аудиофайл")
+    if len(payload) > MAX_VOICE_BYTES:
+        raise HTTPException(status_code=413,
+                            detail=f"аудиофайл слишком большой (максимум {MAX_VOICE_BYTES // (1024 * 1024)} МБ)")
 
     ok, err = await run_in_threadpool(_convert_voice, payload)
     if not ok:
@@ -510,21 +750,45 @@ def get_audio():
         raise HTTPException(status_code=404, detail="Аудиофайл ещё не готов")
     return FileResponse(path, media_type="audio/wav")
 
+# Замок вокруг чтения+очистки очереди уведомлений: работа с web_alerts идёт из
+# разных потоков, а copy()+clear() без замка теряла или дублировала уведомления.
+_alerts_lock = threading.Lock()
+
+
 @app.get("/api/alerts")
 def get_alerts():
-    # Отдаем уведомления веб-клиенту и сразу очищаем очередь
-    if hasattr(work_fuctions, "web_alerts") and len(work_fuctions.web_alerts) > 0:
-        alerts_to_send = work_fuctions.web_alerts.copy()
-        work_fuctions.web_alerts.clear()
-        return {"alerts": alerts_to_send}
+    # Отдаем уведомления веб-клиенту и сразу очищаем очередь (атомарно на нашей стороне)
+    with _alerts_lock:
+        try:
+            pending = getattr(work_fuctions, "web_alerts", None)
+            if pending:
+                alerts_to_send = list(pending)
+                pending.clear()
+                return {"alerts": alerts_to_send}
+        except Exception:
+            pass
     return {"alerts": []}
+
+
+# Приватный каталог под BASE_DIR: /tmp/timer_alert.wav писал любой пользователь,
+# и подменённый файл уходил бы клиенту. Новый путь — первым, старый /tmp —
+# запасной: work_fuctions.timer_alert пока пишет туда литералом, и ломать его
+# нельзя. Когда писатель переедет, запасной путь можно будет убрать.
+_ALERT_AUDIO_PATHS = (BASE_DIR / "logs" / "timer_alert.wav", Path("/tmp/timer_alert.wav"))
+
 
 @app.get("/api/alert_audio")
 def get_alert_audio():
     # Отдаем сгенерированный аудиофайл таймера
-    file_path = "/tmp/timer_alert.wav"
-    if os.path.exists(file_path):
-        return FileResponse(file_path, media_type="audio/wav")
+    for candidate in _ALERT_AUDIO_PATHS:
+        try:
+            # Симлинк — не наш файл: отдавать по нему что угодно нельзя.
+            if candidate.is_symlink():
+                continue
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return FileResponse(str(candidate), media_type="audio/wav")
+        except OSError:
+            continue
     raise HTTPException(status_code=404, detail="Audio not found")
 
 @app.post("/api/location")
@@ -602,17 +866,22 @@ def is_running():
 
 
 def stop_server(timeout=8.0):
-    """Остановить uvicorn и дождаться освобождения порта."""
+    """Остановить uvicorn и дождаться освобождения порта.
+
+    Глобалы чистим ТОЛЬКО после успешного join: если поток ещё жив, состояние
+    оставляем видимым, иначе is_running() начнёт врать («остановлено»).
+    """
     global server_instance, _server_thread
     srv, thread = server_instance, _server_thread
-    server_instance = None
     if srv is None:
+        _server_thread = None
         return True
     srv.should_exit = True
     if thread is not None and thread is not threading.current_thread():
         thread.join(timeout)
     if thread is not None and thread.is_alive():
         return False
+    server_instance = None
     _server_thread = None
     return True
 
@@ -673,11 +942,24 @@ def device_ping(client_id: str = "", token: str = "", battery: int = -1):
 
 @app.post("/api/device/register")
 def device_register(data: DeviceRegisterModel):
-    """Регистрация телефона. Возвращает client_id и токен — их приложение сохраняет."""
-    info = device_control.register_device(
-        name=data.name, kind=data.kind, token=data.token or None,
-        caps=data.caps, model=data.model, os_version=data.os,
-        client_id=data.client_id or None)
+    """Регистрация телефона. Возвращает client_id и токен — их приложение сохраняет.
+
+    Проверку «повторная регистрация существующего client_id требует его токен»
+    выполняет device_control.register_device: он кидает PermissionError, который
+    здесь превращается в 403 (а не в 500). Токен НИКОГДА не отдаём тому, кто его
+    не предъявил.
+    """
+    try:
+        info = device_control.register_device(
+            name=data.name, kind=data.kind, token=data.token or None,
+            caps=data.caps, model=data.model, os_version=data.os,
+            client_id=data.client_id or None)
+    except PermissionError:
+        raise HTTPException(status_code=403,
+                            detail="client_id уже зарегистрирован — повторите с верным токеном устройства")
+    except Exception as e:
+        _log_web_error("/api/device/register", e)
+        raise HTTPException(status_code=500, detail="не удалось зарегистрировать устройство")
     return {"status": "ok", "client_id": info["client_id"], "token": info["token"],
             "name": info["name"], "caps": info["caps"], "server": "LUCH"}
 
@@ -692,27 +974,33 @@ def device_list():
 
 @app.post("/api/device/forget")
 def device_forget(client_id: str = "", token: str = ""):
-    """Забыть устройство (например, телефон украли)."""
-    _device_auth(client_id, token)
+    """Забыть устройство (например, телефон украли).
+
+    Роут административный: закрыт web_token через middleware. Параметр token
+    оставлен для совместимости, но не обязателен — иначе веб-панель (она шлёт
+    только X-Luch-Token) получала бы двойной отказ.
+    """
+    if not client_id:
+        raise HTTPException(status_code=400, detail="Не указан client_id устройства")
     return device_control.forget_device(client_id)
 
 
 @app.post("/api/device/rename")
 def device_rename(client_id: str = "", token: str = "", name: str = ""):
-    """Переименовать устройство."""
-    _device_auth(client_id, token)
+    """Переименовать устройство (административный роут, закрыт web_token)."""
+    if not client_id:
+        raise HTTPException(status_code=400, detail="Не указан client_id устройства")
     return device_control.rename_device(client_id, name)
 
 
 @app.post("/api/device/location")
-def device_location(client_id: str = "", token: str = "", data: LocationModel = None,
-                    x_luch_token: str | None = Header(default=None)):
-    """Телефон прислал свои координаты. Токен устройства ИЛИ web_token."""
-    if not device_control.check_token(client_id, token):
-        if not client_id:
-            _require_web_token(x_luch_token)
-        else:
-            _device_auth(client_id, token)
+def device_location(client_id: str = "", token: str = "", data: LocationModel = None):
+    """Телефон прислал свои координаты (аутентификация токеном устройства)."""
+    if not client_id:
+        raise HTTPException(status_code=400, detail="Не указан client_id устройства")
+    _device_auth(client_id, token)
+    if data is None:
+        raise HTTPException(status_code=400, detail="Не переданы координаты")
     return device_control.report_location(client_id, data.lat, data.lng, data.accuracy)
 
 
@@ -723,13 +1011,21 @@ def device_queue(client_id: str = "", token: str = "", since: int = 0, battery: 
     device_control.touch(client_id, None if battery < 0 else battery)
     pack = device_control.take(client_id, since)
     return {"status": "ok", "commands": pack["commands"], "seq": pack["seq"],
+            # reset нужен телефону, чтобы сбросить свой счётчик выполненных
+            # команд при откате серверного счётчика (пересоздан devices.json).
+            "reset": pack.get("reset", False),
             "device": device_control.device_info(client_id)}
 
 
 @app.post("/api/device/result")
 def device_result(client_id: str = "", token: str = "", data: DeviceResultModel = None):
-    """Телефон отчитывается о выполненной команде."""
+    """Телефон отчитывается о выполненной команде. Тело обязательно."""
+    if not client_id:
+        raise HTTPException(status_code=400, detail="Не указан client_id устройства")
     _device_auth(client_id, token)
+    if data is None:
+        # Раньше тело было необязательным и падало AttributeError → 500.
+        raise HTTPException(status_code=400, detail="Не передано тело результата команды")
     return device_control.submit(client_id, data.cmd_id, data.status, data.output)
 
 

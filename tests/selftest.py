@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -150,6 +151,19 @@ def main() -> int:
 
     web_server.ai_instance = StubAI()
 
+    # Заглушка сама «отвечает»: ручки /api/ask и /api/voice ждут response_ready_event,
+    # без этого тест висел бы полную минуту на каждом таком запросе.
+    _stub = web_server.ai_instance
+    _stub.response = "заглушка"
+    _keep = threading.Event()
+
+    def _answer_loop() -> None:
+        while not _keep.is_set():
+            _stub.response_ready_event.set()
+            time.sleep(0.05)
+
+    threading.Thread(target=_answer_loop, daemon=True).start()
+
     print("\n-- Публичные маршруты --")
     r = client.get("/")
     check("GET / доступен без токена", r.status_code == 200, f"код {r.status_code}")
@@ -186,7 +200,10 @@ def main() -> int:
         ("post", "/api/location"),
         ("post", "/_selftest"),
     ]:
-        r = getattr(client, method)(path, headers=NOAUTH, json={} if method == "post" else None)
+        if method == "get":
+            r = client.get(path, headers=NOAUTH)
+        else:
+            r = client.post(path, headers=NOAUTH, json={})
         check(f"{method.upper()} {path} без токена → 401", r.status_code == 401,
               f"код {r.status_code}")
 
@@ -234,6 +251,28 @@ def main() -> int:
         check("повторная регистрация без токена НЕ выдаёт токен устройства",
               r3.status_code == 403 and not leaked,
               f"код {r3.status_code}, token выдан: {leaked}")
+
+        # /api/voice: телефон не знает web_token, он аутентифицируется токеном устройства
+        fake_wav = ("t.wav", b"RIFF0000WAVEfmt ", "audio/wav")
+        rv = client.post("/api/voice", headers=NOAUTH, files={"file": fake_wav})
+        check("POST /api/voice вообще без токена → 401", rv.status_code == 401,
+              f"код {rv.status_code} — голос с телефона не защищён")
+
+        rv2 = client.post("/api/voice", headers=NOAUTH,
+                          params={"client_id": cid, "token": dev_token},
+                          files={"file": fake_wav})
+        check("POST /api/voice с токеном устройства → не 401",
+              rv2.status_code != 401, f"код {rv2.status_code}")
+
+        # Очередь обязана отдавать reset: телефон сбрасывает по нему свой счётчик
+        rq = client.get("/api/device/queue", headers=NOAUTH,
+                        params={"client_id": cid, "token": dev_token, "since": 0})
+        if rq.status_code == 200:
+            check("GET /api/device/queue возвращает поле reset",
+                  "reset" in (rq.json() or {}), "поле reset отсутствует")
+        else:
+            check("GET /api/device/queue с токеном устройства → 200", False,
+                  f"код {rq.status_code}")
 
     r = client.post("/api/device/location", headers=NOAUTH, json={"lat": 1.0, "lng": 2.0})
     check("POST /api/device/location без client_id → 400 (а не 200 с ошибкой)",
