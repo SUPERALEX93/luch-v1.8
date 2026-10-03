@@ -23,7 +23,7 @@ import json
 import time
 import subprocess
 from art import *
-from colorama import Fore, Back, Style
+from colorama import Fore, Style
 import colorama
 from rich.console import Console
 from rich.panel import Panel
@@ -36,22 +36,24 @@ import requests
 import speech_recognition as sr
 from faster_whisper import WhisperModel,available_models
 from silero_tts.silero_tts import SileroTTS
-from datetime import datetime
 import pygame
 import numpy as np
-from python_speech_features import mfcc
-from scipy.spatial.distance import cosine
 import scipy.io.wavfile as wav
 import torchaudio.transforms as T
-from colorama import Fore, Style, init
-import torch
-from ollama import chat
 import settings
 import work_fuctions
 import web_server
 import console_ui
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+# Дескриптор 2 — общий на весь процесс, а quiet_native может вызываться
+# вложенно из разных мест (микрофон, whisper, TTS). Блокировка + счётчик
+# глубины не дают вложенным блокам закрыть/восстановить чужой дескриптор.
+_NATIVE_LOG_LOCK = threading.RLock()
+_NATIVE_LOG_DEPTH = 0
+_NATIVE_LOG_MAX_BYTES = 512 * 1024
 
 
 @contextlib.contextmanager
@@ -62,40 +64,71 @@ def quiet_native(what=""):
     поэтому обычный перехват не помогает. После блока дескриптор возвращается,
     так что трейсбэки Python по-прежнему видны в консоли.
     """
+    global _NATIVE_LOG_DEPTH
     path = work_fuctions.LOG_DIR / "native.log"
+    with _NATIVE_LOG_LOCK:
+        _NATIVE_LOG_DEPTH += 1
+        outer = _NATIVE_LOG_DEPTH == 1
+    log = None
+    saved = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        log = open(path, "a", encoding="utf-8", errors="replace")
-    except Exception:
-        yield
-        return
-    try:
-        sys.stdout.flush()
-        sys.stderr.flush()
-    except Exception:
-        pass
-    saved = os.dup(2)
-    try:
-        os.dup2(log.fileno(), 2)
-        if what:
-            sys.stderr.write(f"--- {what} ---\n")
-            sys.stderr.flush()
+        if outer:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                # Дешёвая проверка размера: файл не читаем, просто обрезаем,
+                # если журнал разросся (агрессивная обрезка здесь допустима).
+                try:
+                    if path.exists() and path.stat().st_size > _NATIVE_LOG_MAX_BYTES:
+                        with open(path, "wb"):
+                            pass
+                except OSError:
+                    pass
+                log = open(path, "a", encoding="utf-8", errors="replace")
+            except Exception:
+                log = None
+            if log is not None:
+                try:
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                try:
+                    saved = os.dup(2)
+                    os.dup2(log.fileno(), 2)
+                    if what:
+                        sys.stderr.write(f"--- {what} ---\n")
+                        sys.stderr.flush()
+                except Exception:
+                    if saved is not None:
+                        try:
+                            os.close(saved)
+                        except OSError:
+                            pass
+                        saved = None
         yield
     finally:
-        try:
-            sys.stdout.flush()
-            sys.stderr.flush()
-        except Exception:
-            pass
-        os.dup2(saved, 2)
-        os.close(saved)
-        log.close()
-        try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            if len(lines) > 2000:
-                path.write_text("\n".join(lines[-2000:]) + "\n", encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+        if outer:
+            if saved is not None:
+                try:
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                try:
+                    os.dup2(saved, 2)
+                except OSError:
+                    pass
+                try:
+                    os.close(saved)
+                except OSError:
+                    pass
+            if log is not None:
+                try:
+                    log.close()
+                except Exception:
+                    pass
+        with _NATIVE_LOG_LOCK:
+            _NATIVE_LOG_DEPTH = max(0, _NATIVE_LOG_DEPTH - 1)
 
 
 @contextlib.contextmanager
@@ -187,6 +220,40 @@ if not hasattr(torchaudio, 'list_audio_backends'):
 from speechbrain.inference.speaker import SpeakerRecognition
 from speechbrain.utils.fetching import LocalStrategy
 
+
+class _Tee(io.StringIO):
+    """Пишет и в исходный stdout (чтобы вывод был виден в консоли), и в буфер."""
+
+    def __init__(self, mirror):
+        super().__init__()
+        self._mirror = mirror
+
+    def write(self, s):
+        try:
+            self._mirror.write(s)
+        except Exception:
+            pass
+        return super().write(s)
+
+
+# sys.stdout — общий на процесс, поэтому перехват защищён блокировкой:
+# параллельные захваты не должны подменять/восстанавливать чужой stdout.
+_STDOUT_CAPTURE_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def capture_stdout():
+    """Перехватить stdout, дублируя его в консоль. Отдаёт буфер с захваченным текстом."""
+    with _STDOUT_CAPTURE_LOCK:
+        real = sys.stdout
+        tee = _Tee(real)
+        sys.stdout = tee
+        try:
+            yield tee
+        finally:
+            sys.stdout = real
+
+
 class AIconsole:
     # Как пункт меню себя ведёт. Сайт исполняет только "instant", остальное — предупреждение.
     #   instant     — можно выполнять прямо из веба
@@ -218,7 +285,24 @@ class AIconsole:
         "exit": "danger",
     }
 
+    @property
+    def should_exit(self):
+        """Публичное имя флага завершения. Чтение и запись как у обычного атрибута."""
+        return getattr(self, "_should_exit", False)
+
+    @should_exit.setter
+    def should_exit(self, value):
+        self._should_exit = bool(value)
+        if value:
+            event = getattr(self, "_exit_event", None)
+            if event is not None:
+                event.set()
+
     def __init__(self):
+        self._exit_event = threading.Event()
+        self._state_lock = threading.RLock()
+        self._confirm_lock = threading.Lock()
+        self.pending_confirm = None
         self.should_exit = False
         self.stop_audio_triggered = False
         self.ignore_response = False
@@ -226,10 +310,8 @@ class AIconsole:
         self.pending_voice = False
         self.memory_path = Path(settings.PATHS["memory_path"])
         self.memory = self.get_memory_from_file()
-        self.sound = None
         self.ai_speak = False
         self.stop_speak_flags = settings.stop_speak_flags
-        self.listen_while_ai_speak_flag = True
         self.type_work = "chat"
         self.ai_state = "idle"
         self.user_prompt = None
@@ -246,7 +328,6 @@ class AIconsole:
                                  "Запусти её перед общением с ИИ." + Style.RESET_ALL)
         self.ai_thread = threading.Thread(target=self.generate_ai_response, daemon=True)
         self.models_info = []
-        self.default_settings = settings.default_settings
         self.global_context = "ГЛОБАЛЬНЫЙ КОНТЕКСТ: \n"
         self.second_context = ""
         self.response = ""
@@ -272,6 +353,13 @@ class AIconsole:
         self._load_ai_endpoint_from_settings()
         self._migrate_legacy_ai_provider()
         self._banner()
+        # Токен сгенерирован впервые — без него веб-панель не пустит никого,
+        # поэтому показываем его один раз прямо в консоли.
+        if getattr(settings, "web_token_generated", False):
+            print(Fore.YELLOW + "\n 🔑 Сгенерирован web_token для доступа к веб-панели:" + Style.RESET_ALL)
+            print(Fore.CYAN + f"    {settings.settings.get('web_token', '')}" + Style.RESET_ALL)
+            print(Fore.YELLOW + "    Введи его в панели CONFIG на сайте (поле web_token). "
+                                "Он также сохранён в settings.json.\n" + Style.RESET_ALL)
         self.whisper_model = settings.settings["whispermodel"]
         self.micro_index = settings.settings["micro_index"]
         self.tts_voice = settings.settings["tts_voice"]
@@ -331,7 +419,7 @@ class AIconsole:
         with quiet_native("модель проверки голоса"):
             self.voice_verifier = SpeakerRecognition.from_hparams(
                 source="microsoft/spkrec-ecapa-voxceleb",
-                savedir="pretrained_models/spkrec",
+                savedir=str(BASE_DIR / "pretrained_models" / "spkrec"),
                 local_strategy=LocalStrategy.COPY,
                 run_opts={"device": torch_device()}
             )
@@ -354,9 +442,16 @@ class AIconsole:
                     print(Fore.GREEN + "YOUR REFERENCE VOICE IS SAVED!\n" + Style.RESET_ALL)
                 except Exception as e:
                     print(Fore.RED + f"STANDARD RECORDING ERROR: {e}" + Style.RESET_ALL)
-                    return
+                    print(Fore.RED + "⚠ ВНИМАНИЕ: эталон голоса не записан — "
+                                     "проверка голоса ОТКЛЮЧЕНА." + Style.RESET_ALL)
 
-            self.load_profile_tensor()
+            if os.path.exists(self.profile_wav):
+                try:
+                    self.load_profile_tensor()
+                except Exception as e:
+                    self.profile_tensor = None
+                    print(Fore.RED + f"⚠ Не удалось загрузить эталон голоса: {e}. "
+                                     "Проверка голоса отключена." + Style.RESET_ALL)
 
     def _build_system_prompt(self):
         """Собрать системный промпт. Вызывается и на старте, и при смене триггер- слова."""
@@ -464,6 +559,10 @@ command {"command": "название_команды", "args": {"аргумен�
             self.stop_speak_flags = settings.stop_speak_flags
             self.commands_ai = work_fuctions.commands_ai
             self.commands_ai_and_args = work_fuctions.commands_ai_and_args
+            # после перезагрузки модуля колбэк теряется — возвращаем его на место,
+            # иначе таймеры и навигация замолкают
+            work_fuctions.tts_callback = self.play_timer_tts
+            self._ai_command_docs_cache = None
             self.model = settings.settings["model"]
             self.provider = settings.settings.get("provider", "ollama")
             self.zen_api_key = settings.settings.get("zen_api_key", "")
@@ -479,9 +578,11 @@ command {"command": "название_команды", "args": {"аргумен�
             self.speed_ai_speak = settings.settings["speed_ai_speak"]
             self.stt_mode = settings.settings["stt_mode"]
             self.profile_wav = settings.PATHS["voice_profile_path"]
+            self.memory = self.get_memory_from_file()
             self.system_prompt = self._build_system_prompt()
         except Exception as e:
-            print("error reload libs")
+            work_fuctions.log_event("app_errors", f"ошибка перезагрузки модулей: {e}")
+            print(Fore.RED + "error reload libs: %s" % e + Style.RESET_ALL)
 
     # ================= OpenAI-совместимый провайдер ИИ =================
 
@@ -733,7 +834,7 @@ command {"command": "название_команды", "args": {"аргумен�
 
     def _ai_read_stream(self, response):
         """Разбор потока: понимает SSE (`data: `) и голый JSON построчно."""
-        text = ""
+        chunks = []
         for line in response.iter_lines(decode_unicode=True):
             if not line:
                 continue
@@ -774,8 +875,8 @@ command {"command": "название_команды", "args": {"аргумен�
             if isinstance(piece, list):
                 piece = "".join(p.get("text", "") for p in piece if isinstance(p, dict))
             if piece:
-                text += str(piece)
-        return text
+                chunks.append(str(piece))
+        return "".join(chunks)
 
     def list_ai_models(self, base_url=None, api_key=None):
         """Список моделей с {base}/models. Возвращает (ids, ошибка)."""
@@ -843,16 +944,20 @@ command {"command": "название_команды", "args": {"аргумен�
         key = (api_key or "").strip()
         if not key and keep_key:
             key = self.ai_api_key
+        # Таймаут проверяем ДО изменения состояния, иначе плохое значение
+        # оставит объект с частично применёнными настройками.
+        new_timeout = getattr(self, "ai_timeout", 120.0)
+        if timeout:
+            try:
+                new_timeout = float(timeout)
+            except (TypeError, ValueError):
+                raise ValueError("таймаут должен быть числом")
         if activate:
             self.provider = "openai"
         self.ai_base_url = base_url
         self.ai_api_key = key
         self.ai_model = model
-        if timeout:
-            try:
-                self.ai_timeout = float(timeout)
-            except (TypeError, ValueError):
-                raise ValueError("таймаут должен быть числом")
+        self.ai_timeout = new_timeout
         if persist:
             settings.settings["ai_base_url"] = base_url
             settings.settings["ai_api_key"] = key
@@ -1022,12 +1127,19 @@ command {"command": "название_команды", "args": {"аргумен�
         return ""
 
     def _ai_command_docs(self):
-        """Разбор commands_ai_and_args в структуру: имя, иконка, описание, пример вызова."""
+        """Разбор commands_ai_and_args в структуру: имя, иконка, описание, пример вызова.
+
+        Результат кэшируется — текст команд не меняется до /reload_libs.
+        """
+        cache = getattr(self, "_ai_command_docs_cache", None)
+        if cache is not None:
+            return cache
         docs = {}
         current = None
         for raw in (self.commands_ai_and_args or "").splitlines():
             line = raw.strip()
-            m = re.match(r"^\d+\.\s*([A-Za-z_][A-Za-z_0-9]*)\s*-\s*(.+)$", line)
+            # заголовки бывают вида «0a. phone_wake - ...», поэтому буква необязательна
+            m = re.match(r"^\d+[a-z]?\.\s*([A-Za-z_][A-Za-z_0-9]*)\s*-\s*(.+)$", line)
             if m:
                 current = m.group(1)
                 docs[current] = {"desc": m.group(2).strip(), "example": ""}
@@ -1053,6 +1165,7 @@ command {"command": "название_команды", "args": {"аргумен�
                         "icon": (spec or {}).get("icon", ""),
                         "desc": d.get("desc", ""),
                         "example": d.get("example", "")})
+        self._ai_command_docs_cache = out
         return out
 
     def web_command_info(self):
@@ -1089,8 +1202,22 @@ command {"command": "название_команды", "args": {"аргумен�
         }
 
     # ── ИИ-команды: список, схема аргументов и выполнение с сайта ──
-    # Команды, которые реально могут навредить: произвольный shell и блокировка экрана
+    # Команды, которые реально могут навредить: произвольный shell и блокировка
+    # экрана. Основной источник истины — флаг "dangerous" в реестре
+    # work_fuctions.commands_ai; этот кортеж нужен как запасной вариант, если
+    # флага в реестре нет.
     AI_CONFIRM_COMMANDS = ("terminal", "lock_pc")
+
+    def _is_dangerous(self, name):
+        """Опасна ли ИИ-команда (нужно подтверждение пользователя).
+
+        Спрашиваем реестр work_fuctions: если там для команды явно проставлен
+        флаг "dangerous", он и решает — так списки не разъедутся.
+        """
+        entry = (work_fuctions.commands_ai or {}).get(name)
+        if isinstance(entry, dict) and "dangerous" in entry:
+            return bool(entry["dangerous"])
+        return name in self.AI_CONFIRM_COMMANDS
 
     AI_COMMAND_TIMEOUT = 90  # секунд на одну команду с сайта
 
@@ -1127,43 +1254,49 @@ command {"command": "название_команды", "args": {"аргумен�
                 "desc": doc.get("desc", ""),
                 "example": doc.get("example", ""),
                 "args": self._ai_command_signature(name),
-                "danger": name in self.AI_CONFIRM_COMMANDS,
+                "danger": self._is_dangerous(name),
             })
         return out
 
     def web_ai_command_history(self, limit=30):
         """Последние запуски ИИ-команд, чтобы вывод не пропадал после перезагрузки."""
-        history = getattr(self, "_ai_cmd_history", None)
-        if not history:
-            return []
-        return list(history)[-int(limit or 30):]
+        with self._state_lock:
+            history = getattr(self, "_ai_cmd_history", None)
+            if not history:
+                return []
+            return list(history)[-int(limit or 30):]
 
     def web_clear_ai_command_history(self):
-        self._ai_cmd_history = []
-        self._ai_cmd_seq = 0
+        with self._state_lock:
+            self._ai_cmd_history = []
+            self._ai_cmd_seq = 0
         return True
 
     def _push_ai_cmd_history(self, entry):
-        history = getattr(self, "_ai_cmd_history", None)
-        if history is None:
-            history = []
-            self._ai_cmd_history = history
-        seq = getattr(self, "_ai_cmd_seq", 0) + 1
-        self._ai_cmd_seq = seq
-        entry = dict(entry, seq=seq, source=entry.get("source", "site"))
-        history.append(entry)
-        while len(history) > 50:
-            history.pop(0)
-        return entry
+        # журнал пишут и сайт, и чат, и ИИ — серия и обрезка должны быть атомарны
+        with self._state_lock:
+            history = getattr(self, "_ai_cmd_history", None)
+            if history is None:
+                history = []
+                self._ai_cmd_history = history
+            seq = getattr(self, "_ai_cmd_seq", 0) + 1
+            self._ai_cmd_seq = seq
+            entry = dict(entry, seq=seq, source=entry.get("source", "site"))
+            history.append(entry)
+            while len(history) > 50:
+                history.pop(0)
+            return entry
 
     def ai_command_seq(self):
         """Текущий номер последней выполненной команды — чтобы отследить новые."""
-        return getattr(self, "_ai_cmd_seq", 0)
+        with self._state_lock:
+            return getattr(self, "_ai_cmd_seq", 0)
 
     def ai_commands_since(self, seq):
         """Команды, выполненные после отметки seq (для показа в ответе /api/ask)."""
         seq = int(seq or 0)
-        return [e for e in (getattr(self, "_ai_cmd_history", None) or []) if e.get("seq", 0) > seq]
+        with self._state_lock:
+            return [e for e in (getattr(self, "_ai_cmd_history", None) or []) if e.get("seq", 0) > seq]
 
     def _bind_ai_args(self, name, args):
         """Привязать аргументы агента к настоящей сигнатуре: по именам, иначе по порядку.
@@ -1184,42 +1317,31 @@ command {"command": "название_команды", "args": {"аргумен�
 
     def _invoke_ai_command(self, name, kwargs, limit):
         """Вызвать функцию команды ИИ, захватив stdout. -> (value, output, error, elapsed)."""
-        real_stdout, buf = sys.stdout, io.StringIO()
-
-        class _Tee(io.StringIO):
-            def write(self, s):
-                try:
-                    real_stdout.write(s)
-                except Exception:
-                    pass
-                return buf.write(s)
-
         value, error = None, None
-        sys.stdout = _Tee()
         started = time.time()
-        try:
-            holder = {}
+        with capture_stdout() as tee:
+            try:
+                holder = {}
 
-            def _target():
-                try:
-                    holder["value"] = self.commands_ai[name]["func"](**kwargs)
-                except BaseException as exc:            # noqa: BLE001 — ловим и SystemExit
-                    holder["error"] = exc
+                def _target():
+                    try:
+                        holder["value"] = self.commands_ai[name]["func"](**kwargs)
+                    except BaseException as exc:            # noqa: BLE001 — ловим и SystemExit
+                        holder["error"] = exc
 
-            thread = threading.Thread(target=_target, daemon=True)
-            thread.start()
-            thread.join(limit)
-            if thread.is_alive():
-                raise TimeoutError("команда не ответила за %d с" % limit)
-            if holder.get("error") is not None:
-                raise holder["error"]
-            value = holder.get("value")
-        except BaseException as e:                        # noqa: BLE001
-            error = e
-        finally:
-            sys.stdout = real_stdout
-            elapsed = time.time() - started
-        return value, self._ANSI.sub("", buf.getvalue()).strip(), error, elapsed
+                thread = threading.Thread(target=_target, daemon=True)
+                thread.start()
+                thread.join(limit)
+                if thread.is_alive():
+                    raise TimeoutError("команда не ответила за %d с" % limit)
+                if holder.get("error") is not None:
+                    raise holder["error"]
+                value = holder.get("value")
+            except BaseException as e:                        # noqa: BLE001
+                error = e
+            finally:
+                elapsed = time.time() - started
+        return value, self._ANSI.sub("", tee.getvalue()).strip(), error, elapsed
 
     def _record_ai_command(self, name, kwargs, value, output, error, elapsed, source):
         """Одна строка в журнал выполнения — общая для сайта и агента."""
@@ -1282,7 +1404,7 @@ command {"command": "название_команды", "args": {"аргумен�
             known = ", ".join(sorted(self.commands_ai or {}))
             raise ValueError("неизвестная команда ИИ «%s». Доступные: %s" % (name, known))
 
-        if name in self.AI_CONFIRM_COMMANDS and not confirm:
+        if self._is_dangerous(name) and not confirm:
             return {"status": "confirm_required", "command": name, "args": args or {},
                     "output": "Команда «%s» требует подтверждения на сайте." % name}
 
@@ -1303,13 +1425,33 @@ command {"command": "название_команды", "args": {"аргумен�
         # ассистент должен знать, что команда выполнена с сайта
         note = "\nПОЛЬЗОВАТЕЛЬ ВЫПОЛНИЛ С САЙТА КОМАНДУ: %s   АРГУМЕНТЫ: %s   РЕЗУЛЬТАТ: %s" % (
             name, json.dumps(kwargs, ensure_ascii=False), entry["output"][:400])
-        self.second_context += note
-        self.global_context += note
+        with self._state_lock:
+            self.second_context += note
+            self.global_context += note
 
         return {"status": entry["status"], "command": name, "args": kwargs, "icon": icon,
                 "output": entry["output"],
                 "result": None if error is not None else value,
                 "elapsed": entry["elapsed"], "seq": entry["seq"]}
+
+    def _deferred_restart(self):
+        """Дать ответу уйти клиенту и перезапустить веб-сервер."""
+        time.sleep(1.2)
+        try:
+            self.restart_web_server()
+        except Exception as e:
+            print(Fore.RED + f"RESTART ERROR: {e}" + Style.RESET_ALL)
+
+    def _deferred_exit(self):
+        """Дать ответу уйти клиенту и попросить главный цикл завершиться."""
+        time.sleep(1.2)
+        self.should_exit = True
+        try:
+            work_fuctions.exit()      # sys.exit() в этом потоке — просто конец демона
+        except SystemExit:
+            pass
+        except Exception as e:
+            print(Fore.RED + f"EXIT ERROR: {e}" + Style.RESET_ALL)
 
     def web_run_command(self, name, confirm=False):
         """Выполнить пункт меню из веба. Бросает ValueError с понятным текстом."""
@@ -1319,62 +1461,30 @@ command {"command": "название_команды", "args": {"аргумен�
         mode = self.COMMAND_MODES.get(name, "instant")
 
         if mode == "interactive":
-            raise ValueError("пункт /%s задаётся в CONFIG — открой поле «%s»"
-                             % (name, name))
+            raise ValueError("пункт /%s ждёт ввода в терминале — задай его через панель CONFIG "
+                             "на сайте или в консоли" % name)
         if mode == "danger" and not confirm:
             return {"status": "confirm_required",
                     "output": "Команда /%s требует подтверждения." % name}
         if mode == "restart":
-            return {"status": "restart",
-                    "output": "Команда /%s перезапускает LUCH. Подтверди в терминале." % name}
+            # ответ должен уйти клиенту раньше, чем порт закроется
+            threading.Thread(target=self._deferred_restart, daemon=True).start()
+            return {"status": "ok",
+                    "output": "Веб-сервер будет перезапущен через пару секунд."}
+        if mode == "danger":
+            threading.Thread(target=self._deferred_exit, daemon=True).start()
+            return {"status": "ok", "output": "Завершение работы LUCH…"}
 
         func = self.user_commands[name][0]
         if func is None:
             return {"status": "confirm_required",
                     "output": "Пункт /%s ждёт ввода в терминале." % name}
-        return {"status": "ok", "output": self._run_and_capture(name) or "OK"}
-
-    @staticmethod
-    def _strip_ansi(text):
-        return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07", "", text or "")
-
-
-        if name not in self.user_commands:
-            raise ValueError("неизвестная команда /%s" % name)
-        mode = self.COMMAND_MODES.get(name, "instant")
-
-        if mode == "danger" and not confirm:
-            return {"status": "confirm_required",
-                    "output": "Команда /%s требует подтверждения." % name}
-        if mode == "interactive":
-            raise ValueError("пункт /%s ждёт ввода в терминале — задай его через панель CONFIG "
-                             "на сайте или в консоли" % name)
-        if mode == "restart":
-            def _later_restart():
-                time.sleep(1.2)
-                try:
-                    self.restart_web_server()
-                except Exception as e:
-                    print(Fore.RED + f"RESTART ERROR: {e}" + Style.RESET_ALL)
-            threading.Thread(target=_later_restart, daemon=True).start()
-            return {"status": "ok",
-                    "output": "Веб-сервер будет перезапущен через пару секунд."}
-        if mode == "danger":
-            def _later_exit():
-                time.sleep(1.2)
-                try:
-                    work_fuctions.exit()
-                except Exception:
-                    os._exit(0)
-            threading.Thread(target=_later_exit, daemon=True).start()
-            return {"status": "ok", "output": "Завершение работы LUCH…"}
-
         buf = self._run_and_capture(name)
         if buf == "EXITING":
+            # пункт меню завершил программу — просим главный цикл выйти
+            self.should_exit = True
             return {"status": "ok", "output": "Завершение работы LUCH…"}
-        if not buf:
-            return {"status": "ok", "output": "OK"}
-        return {"status": "ok", "output": buf}
+        return {"status": "ok", "output": buf or "OK"}
 
     # Команды печатают результат прямо в консоль. Чтобы он же был виден на сайте,
     # перехватываем stdout и возвращаем его в ответе.
@@ -1382,31 +1492,16 @@ command {"command": "название_команды", "args": {"аргумен�
 
     def _run_and_capture(self, name):
         """Выполняет команду, возвращает её вывод без ANSI-последовательностей."""
-        real = sys.stdout
-        buf = io.StringIO()
-
-        class _Tee(io.StringIO):
-            def write(self, s):
-                try:
-                    real.write(s)
-                except Exception:
-                    pass
-                return buf.write(s)
-
-        sys.stdout = _Tee()
-        try:
-            result = self.user_commands[name][0]()
-        except SystemExit:
-            sys.stdout = real
-            return "EXITING"
-        except Exception as e:
-            sys.stdout = real
-            return "ERROR: %s" % e
-        finally:
-            sys.stdout = real
-        if result == "EXITING":
-            return "EXITING"
-        text = self._ANSI.sub("", buf.getvalue()).strip()
+        with capture_stdout() as tee:
+            try:
+                result = self.user_commands[name][0]()
+            except SystemExit:
+                return "EXITING"
+            except Exception as e:
+                return "ERROR: %s" % e
+            if result == "EXITING":
+                return "EXITING"
+        text = self._ANSI.sub("", tee.getvalue()).strip()
         if text:
             return text
         return "" if result is None else str(result)
@@ -1422,6 +1517,22 @@ command {"command": "название_команды", "args": {"аргумен�
         "stt_mode": str,
         "stt_modes": ["whisper", "google"],
     }
+
+    def _drop_whisper_model(self):
+        """Выгрузить предыдущую модель Whisper и освободить память перед новой."""
+        if getattr(self, "whisper_load_model", None) is None:
+            return
+        self.whisper_load_model = None
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     def web_apply_setting(self, key, value):
         """Горячее изменение одной настройки. Возвращает (значение, предупреждение)."""
@@ -1443,6 +1554,8 @@ command {"command": "название_команды", "args": {"аргумен�
 
         if key == "tts_voice" and not value:
             raise ValueError("имя голоса не может быть пустым")
+        if key == "trigger_word" and not value:
+            raise ValueError("слово-триггер не может быть пустым")
         if key == "speed_ai_speak" and not 0.5 <= value <= 3.0:
             raise ValueError("скорость речи должна быть от 0.5 до 3.0")
         if key == "tts_device":
@@ -1475,11 +1588,12 @@ command {"command": "название_команды", "args": {"аргумен�
                 if self.whisper_model and self.whisper_load_model is None:
                     try:
                         with quiet_native("загрузка whisper"):
+                            self._drop_whisper_model()
                             self.whisper_load_model = load_whisper(self.whisper_model)
                     except Exception as e:
                         warning = "Whisper не загрузился: %s" % e
             else:
-                self.whisper_load_model = None
+                self._drop_whisper_model()
                 warning = "переключено на Google, Whisper выгружен"
         elif key == "tts_device":
             # переносим модель на другое устройство, но только если оно реально меняется
@@ -1500,15 +1614,26 @@ command {"command": "название_команды", "args": {"аргумен�
         settings.save_settings()
         return value, warning
 
+    @staticmethod
+    def _is_secret_key(key):
+        """Похоже ли имя ключа на секрет (в т.ч. api_key внутри ai_providers)."""
+        k = (key or "").lower()
+        return (k in ("api_key", "token", "web_token", "secret", "password")
+                or k.endswith("_api_key") or k.endswith("_token") or k.endswith("_secret"))
+
+    def _mask_secrets(self, value, key=None):
+        """Рекурсивно замаскировать секреты, не отдавая их наружу."""
+        if isinstance(value, dict):
+            return {k: self._mask_secrets(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._mask_secrets(v, key) for v in value]
+        if self._is_secret_key(key):
+            return {"hidden": True, "set": bool(value), "length": len(value or "")}
+        return value
+
     def web_settings_info(self):
-        """Настройки для панели CONFIG. Секреты наружу не отдаются."""
-        data = {}
-        for key, value in settings.settings.items():
-            if key in ("zen_api_key", "ai_api_key", "web_token"):
-                data[key] = {"hidden": True, "set": bool(value), "length": len(value or "")}
-            else:
-                data[key] = value
-        return data
+        """Настройки для панели CONFIG. Секреты наружу не отдаются (рекурсивно)."""
+        return self._mask_secrets(settings.settings)
 
     def change_stt_mode(self):
         list_stt_modes = ["whisper", "google"]
@@ -1532,7 +1657,7 @@ command {"command": "название_команды", "args": {"аргумен�
                 return file.read()
         except Exception as e:
             print("Error reading memory file: " + str(e))
-            return "Error reading memory file: " + str(e)
+            return ""
 
     def change_spped_ai_voice(self):
         while True:
@@ -1614,7 +1739,12 @@ command {"command": "название_команды", "args": {"аргумен�
     def select_trigger_word(self):
         try:
             print(Fore.CYAN + "INPUT THE TRIGGER WORD: >> " + Style.RESET_ALL, end="")
-            self.trigger_word = input()
+            word = input().strip()
+            if not word:
+                print(Fore.YELLOW + "Слово-триггер не может быть пустым — оставляю прежнее: "
+                      + str(self.trigger_word) + Style.RESET_ALL)
+                return
+            self.trigger_word = word
             settings.settings["trigger_word"] = self.trigger_word
             settings.save_settings()
             print(Fore.CYAN + "TRIGGER WORD SET TO: " + self.trigger_word + Style.RESET_ALL)
@@ -1688,6 +1818,18 @@ command {"command": "название_команды", "args": {"аргумен�
                     known = ", ".join(sorted(self.commands_ai))
                     raise ValueError(f"неизвестная команда '{name}'. Доступные: {known}")
                 kwargs = self._bind_ai_args(name, command["args"])
+                if self._is_dangerous(name) and settings.settings.get("confirm_dangerous", True):
+                    # Опасную команду из голоса выполняем только после подтверждения:
+                    # сохраняем её и просим сказать «подтверждаю» или «отмена».
+                    with self._confirm_lock:
+                        self.pending_confirm = {"name": name, "kwargs": kwargs,
+                                                "deadline": time.time() + 30}
+                    ask = ('Подтверди выполнение команды %s. '
+                           'Скажи "подтверждаю" или "отмена".' % name)
+                    self.response = ask
+                    self._last_cmd = None
+                    self.speak_text(ask)
+                    return 1
                 self.ai_state = "command"
                 try:
                     value, output, error, elapsed = self._invoke_ai_command(
@@ -1704,8 +1846,9 @@ command {"command": "название_команды", "args": {"аргумен�
                     res = output or ("" if value is None else str(value))
                     self._last_cmd = (command, res)
                 note = "\nAI executed command:   " + name + "   With args: " + str(command["args"]) + " and result: " + res
-                self.second_context += note
-                self.global_context += note
+                with self._state_lock:
+                    self.second_context += note
+                    self.global_context += note
                 return 0
             except Exception as e:
                 self._last_cmd = (None, f"ОШИБКА: {e}")
@@ -1714,11 +1857,15 @@ command {"command": "название_команды", "args": {"аргумен�
                 if name:
                     self._record_ai_command(name, (command or {}).get("args") or {},
                                             None, "", e, 0.0, "ai")
-                self.second_context += "\nAI: " + full_command + "   BUT THERE WAS AN ERROR IN PARSING OR EXECUTING THE COMMAND: " + str(e)
-                self.global_context += "\nAI: " + full_command + "   BUT THERE WAS AN ERROR IN PARSING OR EXECUTING THE COMMAND: " + str(e)
+                note = ("\nAI: " + full_command + "   BUT THERE WAS AN ERROR IN PARSING OR "
+                        "EXECUTING THE COMMAND: " + str(e))
+                with self._state_lock:
+                    self.second_context += note
+                    self.global_context += note
                 return 0
         else:
-            self.global_context += "\nAI: " + full_command
+            with self._state_lock:
+                self.global_context += "\nAI: " + full_command
             return 1
 
     def _render_ai_response(self, raw, formatted=None):
@@ -1789,6 +1936,7 @@ command {"command": "название_команды", "args": {"аргумен�
                 return
             self.whisper_model = sel.value
             if self.whisper_model in self.whisper_models:
+                self._drop_whisper_model()
                 self.whisper_load_model = load_whisper(self.whisper_model)
                 settings.settings["whispermodel"] = self.whisper_model
                 settings.save_settings()
@@ -1867,13 +2015,22 @@ command {"command": "название_команды", "args": {"аргумен�
         """Выбор модели для встроенного провайдера (ollama / zen)."""
         if kind == "ollama":
             try:
-                self.models_info = ollama.list()
+                # ollama.list() возвращает ListResponse: перебирать его как dict нельзя,
+                # а Client(timeout=...) не даёт зависнуть недоступной Ollama.
+                self.models_info = ollama.Client(timeout=10).list()
             except Exception as e:
                 print(Fore.RED + "Не удалось получить список моделей Ollama: %s" % e + Style.RESET_ALL)
-                self.models_info = []
-            names = [m["name"] for m in self.models_info if isinstance(m, dict) and m.get("name")]
+                self.models_info = None
+            raw_models = []
+            if self.models_info is not None:
+                try:
+                    raw_models = list(self.models_info.get("models") or [])
+                except Exception:
+                    raw_models = []
+            names = [m.get("name") for m in raw_models
+                     if hasattr(m, "get") and m.get("name")]
             if not names:
-                names = [m["name"] for m in self.ollama_data.get("models", [])
+                names = [m.get("name") for m in (self.ollama_data.get("models") or [])
                          if isinstance(m, dict) and m.get("name")]
             if not names:
                 print(Fore.YELLOW + "В Ollama нет загруженных моделей. Скачай модель командой /pull"
@@ -2115,8 +2272,10 @@ command {"command": "название_команды", "args": {"аргумен�
         self.user_prompt = None
 
     def create_prompt(self):
+        # create_second_system_prompt() уходит в system-сообщение (_generate_*),
+        # поэтому здесь повторно его не подмешиваем.
         if self.second_context != "USER:  " + self.user_prompt:
-            return self.global_context + "\n\n\n" + self.create_second_system_prompt() + "\nОТВЕЧАЙ НА ТЕКУЩИЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ ИЛИ ДЕЛАЙ ТО ЧТО СКАЗАЛ ПОЛЬЗОВАТЕЛЬ В ТЕКУЩЕМ ЗАПРОСЕ"
+            return self.global_context + "\n\n\nОТВЕЧАЙ НА ТЕКУЩИЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ ИЛИ ДЕЛАЙ ТО ЧТО СКАЗАЛ ПОЛЬЗОВАТЕЛЬ В ТЕКУЩЕМ ЗАПРОСЕ"
         else:
             return self.global_context + "\n\n\n" + "Вот запрос пользователя:  " + self.user_prompt + "\n" + "Вот системное указание для тебя: " + self.system_prompt + "\nОТВЕЧАЙ НА ТЕКУЩИЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ ИЛИ ДЕЛАЙ ТО ЧТО СКАЗАЛ ПОЛЬЗОВАТЕЛЬ В ТЕКУЩЕМ ЗАПРОСЕ"
 
@@ -2168,7 +2327,7 @@ command {"command": "название_команды", "args": {"аргумен�
             print(Fore.GREEN + "  Продолжаю диалог с текущей моделью" + Style.RESET_ALL)
             return
         try:
-            result = self.process_command("/" + sel.value)
+            result = self.process_command("/" + sel.value, from_web=False)
             if result not in ("OK", "EXITING"):
                 print(Fore.RED + f"Ошибка выполнения пункта меню: {result}" + Style.RESET_ALL)
         except Exception as e:
@@ -2185,21 +2344,25 @@ command {"command": "название_команды", "args": {"аргумен�
             self._generate_ollama()
 
     def _generate_ollama(self):
-        # Формируем payload точно так же, как вы делали
+        # Системная персона отправляется всегда, а не только на одной из веток промпта
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": self.create_prompt()}],
+            "messages": [
+                {"role": "system",
+                 "content": self.system_prompt + self.create_second_system_prompt()},
+                {"role": "user", "content": self.create_prompt()},
+            ],
             "stream": True,
             "options": {
-                "think": False,
                 "num_predict": 512
             }
         }
         
         # Отправляем POST‑запрос на эндпоинт /api/chat
-        response_text = ""
+        chunks = []
         try:
-            with requests.post(self.ollama_url + "chat", json=payload, stream=True, timeout=120) as r:
+            with requests.post(self.ollama_url + "chat", json=payload, stream=True,
+                               timeout=self.ai_timeout) as r:
                 r.raise_for_status()  # если статус не 200 — выбросит исключение
                 for line in r.iter_lines(decode_unicode=True):
                     if line:   # пропускаем пустые строки (kseep-alive)
@@ -2207,10 +2370,11 @@ command {"command": "название_команды", "args": {"аргумен�
                             chunk = json.loads(line)
                             # извлекаем содержимое из потока
                             if 'message' in chunk and 'content' in chunk['message']:
-                                response_text += chunk['message']['content']
+                                chunks.append(chunk['message']['content'])
                         except json.JSONDecodeError:
                             # если вдруг пришёл невалидный JSON — игнорируем
                             continue
+            response_text = "".join(chunks)
         except Exception as e:
             print(Fore.RED + f"Ollama error: {e}" + Style.RESET_ALL)
             response_text = (f"Не удалось получить ответ от Ollama: {e}. "
@@ -2233,10 +2397,10 @@ command {"command": "название_команды", "args": {"аргумен�
             "Authorization": f"Bearer {self.zen_api_key}",
             "Content-Type": "application/json",
         }
-        response_text = ""
+        chunks = []
         try:
             with requests.post(self.zen_url, json=payload, headers=headers, stream=True,
-                               timeout=(15, 300)) as r:
+                               timeout=(15, self.ai_timeout)) as r:
                 r.raise_for_status()
                 for line in r.iter_lines(decode_unicode=True):
                     if not line:
@@ -2251,9 +2415,10 @@ command {"command": "название_команды", "args": {"аргумен�
                             delta = chunk['choices'][0].get('delta', {})
                             piece = delta.get('content', '')
                             if piece:
-                                response_text += piece
+                                chunks.append(piece)
                     except json.JSONDecodeError:
                         continue
+            response_text = "".join(chunks)
         except Exception as e:
             print(Fore.RED + f"OpenCode Zen error: {e}" + Style.RESET_ALL)
             response_text = f"Ошибка OpenCode Zen: {e}. Проверь API-ключ и модель '{self.zen_model}'."
@@ -2320,7 +2485,14 @@ command {"command": "название_команды", "args": {"аргумен�
                 os.replace(fast_path, src)
             except OSError:
                 # запасной путь, если каталоги всё же на разных ф.sys
-                shutil.copyfile(fast_path, src)
+                try:
+                    shutil.copyfile(fast_path, src)
+                except OSError as copy_err:
+                    work_fuctions.log_event(
+                        "voice_errors", f"не удалось заменить файл озвучки: {copy_err}")
+                    print(Fore.YELLOW + f"Не удалось применить скорость речи: {copy_err}"
+                          + Style.RESET_ALL)
+                    return False
             return True
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
             work_fuctions.log_event("voice_errors", f"не удалось применить скорость речи: {e}")
@@ -2341,14 +2513,23 @@ command {"command": "название_команды", "args": {"аргумен�
             print(Fore.RED + f"Ошибка синтеза речи: {e}" + Style.RESET_ALL)
             return False
         self.speed_up_audio(path)
+        # Сначала объявляем новый поток текущим, и только потом поднимаем флаг:
+        # так завершающийся старый поток уже не сможет сбросить флаг новой речи.
         try:
-            self.speak_thread = threading.Thread(target=self.play_response, daemon=True)
-            self.speak_thread.start()
+            thread = threading.Thread(target=self.play_response, daemon=True)
         except Exception as e:
-            print(Fore.RED + f"Не удалось запустить озвучку: {e}" + Style.RESET_ALL)
+            print(Fore.RED + f"Не удалось создать поток озвучки: {e}" + Style.RESET_ALL)
             return False
+        self.speak_thread = thread
         self.ai_speak = True
         self.ai_state = "speaking"
+        try:
+            thread.start()
+        except Exception as e:
+            print(Fore.RED + f"Не удалось запустить озвучку: {e}" + Style.RESET_ALL)
+            self.ai_speak = False
+            self.ai_state = "idle"
+            return False
         return True
 
     def play_response(self):
@@ -2360,9 +2541,12 @@ command {"command": "название_команды", "args": {"аргумен�
             pygame.time.wait(sound_duration)
         except Exception as e:
             print(Fore.RED + f"Ошибка воспроизведения: {e}" + Style.RESET_ALL)
-        if self.ai_speak == True:
-            self.ai_speak = False
-        self.ai_state = "idle"
+        finally:
+            # сбрасываем флаг только если мы всё ещё последний поток озвучки:
+            # иначе можно погасить флаг новой речи
+            if getattr(self, "speak_thread", None) is threading.current_thread():
+                self.ai_speak = False
+                self.ai_state = "idle"
 
     def play_timer_tts(self, text, path):
         """Эта функция вызывается из work_fuctions, когда срабатывает таймер"""
@@ -2375,15 +2559,16 @@ command {"command": "название_команды", "args": {"аргумен�
             print(f"Timer TTS error: {e}")
 
     def full_relese_response(self):
-        self.second_context = "USER:  " + self.user_prompt
-        self.global_context += "\nUSER:  " + self.user_prompt
+        with self._state_lock:
+            self.second_context = "USER:  " + self.user_prompt
+            self.global_context += "\nUSER:  " + self.user_prompt
+            if len(self.global_context) > 1000:
+                us_metka = self.global_context.find("USER:")
+                self.global_context = self.global_context[us_metka:]
         if "заблокируй компьютер" in self.user_prompt or "заблокируй пк" in self.user_prompt or "заблокируй комп" in self.user_prompt:
             work_fuctions.lock_pc()
             self.user_prompt = None
             pass
-        if len(self.global_context) > 1000:
-            us_metka = self.global_context.find("USER:")
-            self.global_context = self.global_context[us_metka:]
         self.ai_thread = threading.Thread(target=self.generate_ai_response, daemon=True)
         self.ai_state = "thinking"
         self.ai_thread.start()
@@ -2392,7 +2577,7 @@ command {"command": "название_команды", "args": {"аргумен�
             self.ai_thread.join()
         i2 = self.parse_ai_command(self.response)
         self._render_ai_response(self.response)
-        if i2 == 1:
+        if i2 == 1 and self.pending_confirm is None:
             self.speak_text(self.response)
         rounds = 0
         while i2 == 0 and rounds < 20:
@@ -2404,7 +2589,7 @@ command {"command": "название_команды", "args": {"аргумен�
             self.ai_thread.join()
             i2 = self.parse_ai_command(self.response)
             self._render_ai_response(self.response)
-            if i2 == 1:
+            if i2 == 1 and self.pending_confirm is None:
                 self.speak_text(self.response)
         if i2 == 0:
             print(Fore.YELLOW + "ИИ слишком долго просит команды — останавливаюсь." + Style.RESET_ALL)
@@ -2413,6 +2598,51 @@ command {"command": "название_команды", "args": {"аргумен�
         self.user_prompt = None
         self.response_ready_event.set()
         self._print_prompt()
+
+    # Слова подтверждения/отмены для опасных команд из голоса
+    CONFIRM_YES_WORDS = ("подтверждаю", "подтвердить", "да", "выполняй", "ок")
+    CONFIRM_NO_WORDS = ("отмена", "нет", "стоп")
+
+    @staticmethod
+    def _confirm_tokens(text):
+        """Слова фразы без пунктуации — чтобы «погода» не совпала с «да»."""
+        return set(re.findall(r"[а-яёa-z0-9]+", (text or "").lower()))
+
+    def _handle_pending_confirm(self, text):
+        """Разобрать ответ на запрос подтверждения. True — фраза обработана здесь."""
+        with self._confirm_lock:
+            pending = self.pending_confirm
+            if pending is None:
+                return False
+            # снимаем запрос сразу: подтверждение/отмена обрабатываются ровно один раз
+            self.pending_confirm = None
+
+        words = self._confirm_tokens(text)
+        lowered = (text or "").lower()
+        expired = time.time() > pending.get("deadline", 0)
+        if expired:
+            reply = "Время подтверждения истекло — команда отменена."
+        elif (words & set(self.CONFIRM_NO_WORDS)) or re.search(r"\bне\s+надо\b", lowered):
+            reply = "Отменяю выполнение команды."
+        elif words & set(self.CONFIRM_YES_WORDS):
+            name = pending.get("name")
+            kwargs = pending.get("kwargs") or {}
+            self.ai_state = "command"
+            try:
+                value, output, error, elapsed = self._invoke_ai_command(
+                    name, kwargs, self.AI_COMMAND_TIMEOUT)
+            finally:
+                self.ai_state = "speaking" if self.ai_speak else "idle"
+            self._record_ai_command(name, kwargs, value, output, error, elapsed, "voice-confirm")
+            if error is not None:
+                reply = "ОШИБКА: %s: %s" % (type(error).__name__, error)
+            else:
+                reply = output or ("" if value is None else str(value)) or "Команда выполнена."
+        else:
+            reply = "Не понял подтверждение — команда отменена."
+        self.response = reply
+        self.speak_text(reply)
+        return True
 
     def listen_user(self, from_file=False):
         recognizer = sr.Recognizer()
@@ -2427,7 +2657,18 @@ command {"command": "название_команды", "args": {"аргумен�
                     f.write(audio.get_wav_data())
 
             temp_tensor = self.get_audio_tensor(audio)
-            score, prediction = self.voice_verifier.verify_batch(self.profile_tensor, temp_tensor)
+            if self.profile_tensor is None:
+                # Эталон не загружен (запись не удалась) — не роняем поток,
+                # просто принимаем фразу без голосовой проверки.
+                print(Fore.YELLOW + "Проверка голоса отключена (нет эталона) — "
+                      "фраза принимается без проверки." + Style.RESET_ALL)
+                score_value = 0.0
+                voice_ok = True
+            else:
+                score, prediction = self.voice_verifier.verify_batch(
+                    self.profile_tensor, temp_tensor)
+                score_value = float(score.item()) if hasattr(score, "item") else float(score)
+                voice_ok = bool(prediction.item())
 
             if self.stt_mode == "whisper":
                 try:
@@ -2448,22 +2689,31 @@ command {"command": "название_команды", "args": {"аргумен�
                     print(e)
                     text = ""
 
-            if prediction.item() is True:
+            if voice_ok:
+                # Подтверждение опасной команды разбираем раньше триггер-слова
+                if self._handle_pending_confirm(text):
+                    return
                 if not self.ai_speak:
                     if text and self.user_prompt is None:
-                        has_trigger = text[0:len(self.trigger_word)].lower() == self.trigger_word.lower()
+                        trigger = (self.trigger_word or "").strip()
+                        has_trigger = bool(trigger) and \
+                            text[:len(trigger)].lower() == trigger.lower()
 
                         if self.ai_thread.is_alive() == False and has_trigger:
                             self.type_work = "voice"
                             print(Fore.MAGENTA + f"[VOICE MATCHED]: {text}" + Style.RESET_ALL)
 
                             # Отрезаем триггер-слово из текста перед отправкой в ИИ
-                            clean_prompt = text[len(self.trigger_word):].strip(" ,.!?-")
+                            clean_prompt = text[len(trigger):].strip(" ,.!?-")
                             self.user_prompt = clean_prompt if clean_prompt else "Привет!"
 
                             self.full_relese_response()
                             self.type_work = "chat"
                             self.is_voice_success = True
+                        elif not trigger:
+                            print(Fore.YELLOW + "[TRIGGER DISABLED]: слово-триггер не задано — "
+                                  "фраза проигнорирована." + Style.RESET_ALL)
+                            self.ai_state = "idle"
                         elif not has_trigger:
                             print(Fore.YELLOW + f"[TRIGGER MISSING]: Фраза '{text}' проигнорирована (нет триггер-слова)." + Style.RESET_ALL)
                             self.response = f"Сообщение проигнорировано: отсутствует триггер-слово '{self.trigger_word}'."
@@ -2479,7 +2729,6 @@ command {"command": "название_команды", "args": {"аргумен�
                                 self.response = ""
                                 return
             else:
-                score_value = float(score.item())
                 work_fuctions.log_event(
                     "access_denied",
                     f"Чужой голос! score={score_value:.4f} | текст: {text!r}",
@@ -2509,17 +2758,47 @@ command {"command": "название_команды", "args": {"аргумен�
         else:
             # Обычное прослушивание микрофона ПК в бесконечном цикле
             recognizer.pause_threshold = 1.5
-            with open_microphone(self.micro_index, sample_rate=48000, chunk_size=2048) as source:
-                recognizer.adjust_for_ambient_noise(source, duration=2)
-                while True:
-                    audio = recognizer.listen(source)
-                    process_audio(audio)
+            try:
+                with open_microphone(self.micro_index, sample_rate=48000, chunk_size=2048) as source:
+                    recognizer.adjust_for_ambient_noise(source, duration=2)
+                    while not self.should_exit:
+                        try:
+                            # timeout=1 — цикл просыпается, чтобы проверить should_exit;
+                            # phrase_time_limit=15 — не даём одной фразе залипнуть навсегда
+                            audio = recognizer.listen(source, timeout=1, phrase_time_limit=15)
+                        except sr.WaitTimeoutError:
+                            continue
+                        except Exception as e:
+                            work_fuctions.log_event(
+                                "voice_errors", f"ошибка записи с микрофона: {e}")
+                            print(Fore.RED + f"Ошибка записи с микрофона: {e}" + Style.RESET_ALL)
+                            continue
+                        try:
+                            process_audio(audio)
+                        except Exception as e:
+                            # одна плохая фраза не должна убивать весь голосовой цикл
+                            work_fuctions.log_event(
+                                "voice_errors", f"ошибка обработки фразы: {e}")
+                            print(Fore.RED + f"Ошибка обработки фразы: {e}" + Style.RESET_ALL)
+            except Exception as e:
+                print(Fore.RED + f"Не удалось открыть микрофон: {e}" + Style.RESET_ALL)
+                return
 
-    def process_command(self, cmd):
+    def process_command(self, cmd, from_web=False):
+        """Выполнить команду из строки.
+
+        from_web=True (так зовёт веб-сервер) — интерактивные пункты запрещены:
+        они ждут input() и заблокировали бы worker-поток FastAPI.
+        По умолчанию считаем вызов локальным (консоль) и разрешаем всё.
+        """
         cmd = (cmd or "").strip()
         if cmd.startswith("/") and cmd[1:] in self.user_commands:
+            name = cmd[1:]
+            if from_web and self.COMMAND_MODES.get(name, "instant") != "instant":
+                return ("Команда /%s недоступна из веба — задай её в CONFIG "
+                        "на сайте или в терминале." % name)
             try:
-                self.user_commands[cmd[1:]][0]()
+                self.user_commands[name][0]()
             except SystemExit:
                 # /exit из веба или голоса: не роняем поток, а просим главный цикл завершиться
                 self.should_exit = True
@@ -2538,6 +2817,9 @@ command {"command": "название_команды", "args": {"аргумен�
                     # нет TTY или ввод закрыт — не оставляем мёртвый поток с трассировкой
                     self.should_exit = True
                     return
+            else:
+                # ввод уже ждёт обработки — не крутимся вхолостую
+                self._exit_event.wait(0.02)
 
     def chat(self):
         if self.whisper_model is None or self.whisper_model == "":
@@ -2555,7 +2837,10 @@ command {"command": "название_команды", "args": {"аргумен�
             self.input_thread.start()
 
         while not self.should_exit:
-            time.sleep(0.001)
+            # не busy-wait: просыпаемся по сигналу выхода или раз в 50 мс
+            self._exit_event.wait(0.05)
+            if self.should_exit:
+                break
 
             # Обработка записи с веб-сервера через listen_user(from_file=True)
             if self.pending_voice:
@@ -2567,7 +2852,7 @@ command {"command": "название_команды", "args": {"аргумен�
                 self.second_system_prompt = ""
                 self.second_context = ""
                 if self.user_prompt.strip()[0] == "/":
-                    result = self.process_command(self.user_prompt)
+                    result = self.process_command(self.user_prompt, from_web=False)
                     if result == "UNKNOWN COMMAND":
                         print(Fore.YELLOW + "UNKNOWN COMMAND" + Style.RESET_ALL)
                     elif result not in ("OK", "EXITING"):

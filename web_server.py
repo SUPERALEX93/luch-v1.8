@@ -366,7 +366,9 @@ def execute_command(data: CommandModel):
         return JSONResponse({"status": "error", "detail": "Пустая команда",
                              "output": "Пустая команда"}, status_code=400)
     try:
-        result = ai_instance.process_command(cmd)
+        # from_web=True: интерактивные пункты меню (input()/стрелки) из веба
+        # запускать нельзя — они заблокировали бы worker-поток FastAPI.
+        result = ai_instance.process_command(cmd, from_web=True)
     except ValueError as e:
         return JSONResponse({"status": "error", "detail": str(e), "output": str(e)},
                             status_code=400)
