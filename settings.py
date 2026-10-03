@@ -29,7 +29,7 @@ default_settings = {"model": "",
                     "micro_index": 1, 
                     "tts_voice": "xenia", 
                     "tts_device": "auto",
-                    "trigger_word":"",
+                    "trigger_word":"луч",
                     "speed_ai_speak": 1.0,
                     "stt_mode":"google"
                     }

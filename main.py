@@ -416,13 +416,43 @@ class AIconsole:
             ("🚪 ВЫХОД", ["exit"]),
         ]
 
-        with quiet_native("модель проверки голоса"):
-            self.voice_verifier = SpeakerRecognition.from_hparams(
-                source="microsoft/spkrec-ecapa-voxceleb",
-                savedir=str(BASE_DIR / "pretrained_models" / "spkrec"),
-                local_strategy=LocalStrategy.COPY,
-                run_opts={"device": torch_device()}
-            )
+        # Модель проверки голоса весит ~90 МБ и намеренно не лежит в git.
+        # Пытаемся взять её из pretrained_models/spkrec, при отсутствии
+        # докачиваем через fetch_models.py, а если и это не вышло — работаем
+        # дальше без голосового пропуска вместо падения на старте.
+        self.voice_verifier = None
+        spkrec = BASE_DIR / "pretrained_models" / "spkrec"
+        local_model = (spkrec / "hyperparams.yaml").is_file() and \
+            (spkrec / "embedding_model.ckpt").is_file()
+        if not local_model:
+            print(Fore.YELLOW + "Модель проверки голоса не найдена, пробую скачать..."
+                  + Style.RESET_ALL)
+            try:
+                import fetch_models
+                fetch_models.main()
+                local_model = (spkrec / "hyperparams.yaml").is_file() and \
+                    (spkrec / "embedding_model.ckpt").is_file()
+            except Exception as e:
+                print(Fore.YELLOW + f"Не удалось скачать модель: {e}" + Style.RESET_ALL)
+
+        if local_model:
+            try:
+                with quiet_native("модель проверки голоса"):
+                    self.voice_verifier = SpeakerRecognition.from_hparams(
+                        source=str(spkrec),
+                        savedir=str(spkrec),
+                        local_strategy=LocalStrategy.COPY,
+                        run_opts={"device": torch_device()}
+                    )
+            except Exception as e:
+                print(Fore.RED + f"Модель проверки голоса не загрузилась: {e}"
+                      + Style.RESET_ALL)
+
+        if self.voice_verifier is None:
+            print(Fore.YELLOW
+                  + "Проверка голоса отключена: ассистент будет принимать любой голос."
+                  + "\nЧтобы включить её, выполните: python fetch_models.py"
+                  + Style.RESET_ALL)
         self.profile_tensor = None
 
         recognizer = sr.Recognizer()
@@ -1811,6 +1841,10 @@ command {"command": "название_команды", "args": {"аргумен�
         return tensor
 
     def load_profile_tensor(self):
+        if self.voice_verifier is None:
+            self.profile_tensor = None
+            return
+
         fs, prof_audio = wav.read(self.profile_wav)
         prof_audio = prof_audio.astype(np.float32) / 32768.0
         tensor = torch.from_numpy(prof_audio).unsqueeze(0)
@@ -2707,10 +2741,10 @@ command {"command": "название_команды", "args": {"аргумен�
                     f.write(audio.get_wav_data())
 
             temp_tensor = self.get_audio_tensor(audio)
-            if self.profile_tensor is None:
-                # Эталон не загружен (запись не удалась) — не роняем поток,
-                # просто принимаем фразу без голосовой проверки.
-                print(Fore.YELLOW + "Проверка голоса отключена (нет эталона) — "
+            if self.profile_tensor is None or self.voice_verifier is None:
+                # Эталон не загружен или модель проверки недоступна — не роняем
+                # поток, просто принимаем фразу без голосовой проверки.
+                print(Fore.YELLOW + "Проверка голоса отключена — "
                       "фраза принимается без проверки." + Style.RESET_ALL)
                 score_value = 0.0
                 voice_ok = True

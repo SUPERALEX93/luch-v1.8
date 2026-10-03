@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import re
+import tempfile
 import os
 import sys
 import time
@@ -77,6 +78,24 @@ def _fake_microphone(device_index=None, **kwargs):
     yield object()
 
 
+def prepare_profile() -> str:
+    """Готовит синтетический эталон голоса во временном файле.
+
+    Без микрофона записать эталон нечем, а `AIconsole` без него честно
+    оставляет проверку голоса выключенной. Чтобы проверка была честной,
+    а не зависела от того, что файл случайно остался от прошлого запуска,
+    кладём рядом сгенерированный WAV и уводим путь в temp.
+    """
+    import numpy as np
+    import soundfile as wav
+
+    path = Path(tempfile.gettempdir()) / "luch-smoke-voice-profile.wav"
+    # main.py читает эталон как int16 и делит на 32768 — пишем именно PCM_16.
+    tone = (np.sin(np.arange(16000 * 3) * 0.01) * 3000).astype("int16")
+    wav.write(str(path), tone, 16000, subtype="PCM_16")
+    return str(path)
+
+
 def install_stubs() -> None:
     main.quiet_native = lambda what="": contextlib.nullcontext()
     main.open_microphone = _fake_microphone
@@ -95,6 +114,8 @@ def main_test() -> int:
     install_stubs()
 
     print("-- создание AIconsole --")
+    profile_path = prepare_profile()
+    main.settings.PATHS["voice_profile_path"] = profile_path
     t0 = time.time()
     try:
         ai = main.AIconsole()
@@ -109,7 +130,12 @@ def main_test() -> int:
     print("-- состояние после инициализации --")
     check("profile_tensor загружен", ai.profile_tensor is not None)
     check("voice_verifier доступен", ai.voice_verifier is not None)
-    check("whisper-модель подставлена", ai.whisper_load_model is not None)
+    # Локальная модель грузится только при stt_mode="whisper". В режиме google
+    # (он же по умолчанию) её отсутствие — это норма, а не поломка.
+    if ai.stt_mode == "whisper":
+        check("whisper-модель подставлена", ai.whisper_load_model is not None)
+    else:
+        check("whisper не нужен в режиме google", ai.whisper_load_model is None)
     check("tts создан", ai.tts is not None)
     check("menu_layout заполнен", bool(ai.menu_layout))
     check("user_commands заполнен", bool(ai.user_commands))
