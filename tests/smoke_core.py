@@ -27,6 +27,7 @@ os.chdir(BASE_DIR)
 
 import main  # noqa: E402
 import settings  # noqa: E402
+import web_server  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[tuple[str, str]] = []
@@ -207,6 +208,25 @@ def main_test() -> int:
     check("/web_token не путает токен с zen_api_key",
           main.settings.settings.get("zen_api_key", "") not in " ".join(shown),
           "напечатан посторонний ключ")
+
+    # play_audio решает, озвучит ли телефон ответ. Раньше он зависел от
+    # ai_speak (мигающий флаг «сервер сейчас играет») и всегда приходил
+    # ложным — телефон молчал. Проверяем на самом файле ответа.
+    import tempfile as _tf
+    _old_resp = main.settings.PATHS["response_path"]
+    try:
+        _fd, _tmp = _tf.mkstemp(suffix=".wav"); os.close(_fd)
+        main.settings.PATHS["response_path"] = _tmp
+        import time as _tm
+        check("_fresh_audio: свежий файл ответа -> озвучивать", web_server._fresh_audio(_tm.time()) is True)
+        os.utime(_tmp, (_tm.time() - 60, _tm.time() - 60))
+        # файл от предыдущего запроса нельзя выдавать за звук текущего
+        check("_fresh_audio: старый файл -> не озвучивать", web_server._fresh_audio(_tm.time()) is False)
+        os.remove(_tmp)
+        main.settings.PATHS["response_path"] = os.path.join(_tf.gettempdir(), "нет-такого-файла.wav")
+        check("_fresh_audio: файла нет -> молчим", web_server._fresh_audio(_tm.time()) is False)
+    finally:
+        main.settings.PATHS["response_path"] = _old_resp
 
     print("\n-- маскировка секретов --")
     info = ai.web_settings_info()

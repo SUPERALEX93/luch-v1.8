@@ -454,6 +454,19 @@
         function releaseObjectUrl(url) { if (url) { try { URL.revokeObjectURL(url); } catch (e) {} } }
         function resetPlayButtons() { document.querySelectorAll('.play-audio-btn').forEach(b => { if (b.dataset.ready) b.innerHTML = '🔊 ОТВЕТ'; }); }
 
+        // Раньше ошибка воспроизведения проглатывалась впустую: кнопка просто
+        // оставалась «ОТВЕТ», и выглядело это как «звука нет у ассистента».
+        // Теперь причина видна сразу на кнопке.
+        function playOrWarn(btn, promise) {
+            return promise.then(() => { isAudioPlaying = true; btn.innerHTML = '⏸ СТОП'; })
+                .catch(e => {
+                    isAudioPlaying = false;
+                    btn.innerHTML = '🔇 НЕТ ЗВУКА';
+                    btn.title = 'Не удалось включить звук: ' + ((e && e.name) || e);
+                    console.warn('playback', e);
+                });
+        }
+
         async function appendPlayButton(msgContainer) {
             const holder = msgContainer.querySelector('.body') || msgContainer;
             const btn = document.createElement('button'); btn.className = 'play-audio-btn'; btn.innerHTML = 'DL...'; btn.disabled = true;
@@ -466,7 +479,7 @@
                 btn.dataset.ready = '1';
                 btn.innerHTML = '🔊 ОТВЕТ'; btn.disabled = false;
                 const markOthers = () => document.querySelectorAll('.play-audio-btn').forEach(b => { if (b !== btn && b.dataset.ready) b.innerHTML = '🔊 ОТВЕТ'; });
-                btn.onclick = () => {
+                btn.onclick = async () => {
                     // если это тот же трек и он играет — ставим на паузу
                     if (audioPlayer.src === url && !audioPlayer.paused) {
                         audioPlayer.pause(); audioPlayer.currentTime = 0; isAudioPlaying = false; btn.innerHTML = '🔊 ОТВЕТ'; return;
@@ -474,12 +487,15 @@
                     audioPlayer.src = url;   // играем именно эту реплику, а не последнюю загруженную
                     audioPlayer.currentTime = 0;
                     markOthers(); btn.innerHTML = '⏸ СТОП';
-                    audioPlayer.play().then(() => { isAudioPlaying = true; }).catch(() => { btn.innerHTML = '🔊 ОТВЕТ'; });
+                    await playOrWarn(btn, audioPlayer.play());
                 };
                 audioPlayer.onended = () => { isAudioPlaying = false; releaseObjectUrl(url); if (currentAudioUrl === url) currentAudioUrl = null; resetPlayButtons(); };
                 audioPlayer.onerror = () => { isAudioPlaying = false; resetPlayButtons(); };
                 audioPlayer.src = url;
-                audioPlayer.play().then(() => { isAudioPlaying = true; btn.innerHTML = '⏸ СТОП'; }).catch(() => 0);
+                // автозапуск: на Android WebView он блокируется без
+                // mediaPlaybackRequiresUserGesture=false, поэтому ошибку
+                // показываем, а не прячем
+                await playOrWarn(btn, audioPlayer.play());
             } catch (err) { btn.innerHTML = 'ERROR'; }
         }
 

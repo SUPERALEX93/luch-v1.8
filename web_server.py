@@ -342,6 +342,7 @@ def ask_ai(data: QueryModel):
         raise HTTPException(status_code=500, detail="Экземпляр AI не инициализирован")
 
     seq_before = ai_instance.ai_command_seq()
+    ask_started_at = time.time()
     ai_instance.response_ready_event.clear()
     ai_instance.user_prompt = data.text
 
@@ -352,7 +353,8 @@ def ask_ai(data: QueryModel):
     return {
         "status": "ok",
         "response": ai_instance.format_response(ai_instance.response),
-        "play_audio": getattr(ai_instance, 'ai_speak', False),
+        # тот же принцип, что и в /api/voice: файл ответа, а не мигающий флаг
+        "play_audio": _fresh_audio(ask_started_at),
         "commands": ai_instance.ai_commands_since(seq_before),
     }
 
@@ -691,6 +693,22 @@ async def selftest(report: str = Body(...)):
     return {"ok": True}
 
 
+def _fresh_audio(request_started_at, tolerance=2.0):
+    """Есть ли WAV-ответ, соответствующий текущему запросу.
+
+    Сервер пишет озвучку в response.wav и сразу проигрывает её на колонках.
+    Флаг ai_speak к моменту ответа в телефон уже погас, поэтому ориентируемся
+    на свежесть самого файла.
+    """
+    path = Path(settings.PATHS["response_path"])
+    try:
+        if not path.is_file():
+            return False
+        return path.stat().st_mtime >= request_started_at - tolerance
+    except OSError:
+        return False
+
+
 @app.post("/api/voice")
 async def ask_ai_voice(file: UploadFile = File(...),
                        client_id: str = "",
@@ -719,6 +737,10 @@ async def ask_ai_voice(file: UploadFile = File(...),
     if len(payload) > MAX_VOICE_BYTES:
         raise HTTPException(status_code=413,
                             detail=f"аудиофайл слишком большой (максимум {MAX_VOICE_BYTES // (1024 * 1024)} МБ)")
+
+    # Момент запроса нужен ниже: по нему мы поймём, что аудиофайл ответа
+    # принадлежит именно этому запросу, а не прошлому.
+    voice_request_at = time.time()
 
     ok, err = await run_in_threadpool(_convert_voice, payload)
     if not ok:
@@ -761,11 +783,17 @@ async def ask_ai_voice(file: UploadFile = File(...),
             "play_audio": False
         }
 
+    # Раньше здесь стояло «ai_speak или is_voice_success». Оба флага означают
+    # не наличие звука, а состояние сервера: ai_speak=True только пока сервер
+    # прямо сейчас озвучивает ответ на колонках и сбрасывается сразу после, а
+    # is_voice_success — про успешное распознавание голоса. Телефон успевал
+    # получить play_audio=false, и ответ не озвучивался вообще.
+    # Наличие звука определяем по файлу: он должен быть свежее этого запроса.
     return {
         "status": "ok",
         "user_text": ai_instance.user_prompt or "Голосовой запрос",
         "response": ai_instance.format_response(ai_instance.response),
-        "play_audio": getattr(ai_instance, 'ai_speak', False) or getattr(ai_instance, 'is_voice_success', False)
+        "play_audio": _fresh_audio(voice_request_at)
     }
 
 @app.get("/api/audio")
