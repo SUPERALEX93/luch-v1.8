@@ -3,6 +3,8 @@ package proekt.luch.app
 import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
+import android.location.Location
+import android.location.LocationManager
 import android.media.AudioManager
 import android.media.Ringtone
 import android.media.RingtoneManager
@@ -12,6 +14,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import androidx.core.app.NotificationManagerCompat
+import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -19,6 +22,7 @@ class CommandRunner(private val context: Context) {
 
     private val notifSeq = AtomicInteger(1000)
     private val phone = PhoneControl(context)
+    private val prefs = Prefs(context)
     private var ringing: Ringtone? = null
 
     fun run(name: String, args: JSONObject): Pair<String, String> = try {
@@ -30,7 +34,7 @@ class CommandRunner(private val context: Context) {
             "ring" -> ring()
             "open_url" -> openUrl(args.optString("url", ""))
             "battery" -> "ok" to "заряд батареи: ${Prefs.batteryText(context)}"
-            "location" -> "ok" to "координаты отправлены"
+            "location" -> sendLocation()
             // управление телефоном по командам ИИ
             "status" -> phone.status()
             "wake" -> phone.wake()
@@ -52,6 +56,39 @@ class CommandRunner(private val context: Context) {
         }
     } catch (e: Exception) {
         "error" to (e.message ?: e.javaClass.simpleName)
+    }
+
+    /**
+     * Отправить на сервер последнюю известную геопозицию и честно отчитаться.
+     *
+     * Раньше команда возвращала «координаты отправлены», ничего не отправляя:
+     * сервер считал, что получил позицию, хотя её не было.
+     */
+    private fun sendLocation(): Pair<String, String> {
+        val lm = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+            ?: return "error" to "служба геолокации недоступна"
+        // Тип не указываем явно: после elvis-оператора Kotlin выведет non-null Location.
+        val best = runCatching {
+            listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER,
+                LocationManager.PASSIVE_PROVIDER)
+                .mapNotNull { runCatching { lm.getLastKnownLocation(it) }.getOrNull() }
+                .maxByOrNull { it.time }
+        }.getOrNull()
+            ?: return "error" to "нет известных координат — включи геолокацию и открой карту"
+        if (prefs.serverUrl.isEmpty() || prefs.clientId.isEmpty())
+            return "error" to "устройство ещё не зарегистрировано на сервере"
+        val payload = JSONObject()
+            .put("lat", best.latitude)
+            .put("lng", best.longitude)
+            .put("accuracy",
+                if (best.hasAccuracy()) best.accuracy.toDouble() else JSONObject.NULL)
+        val (_, code) = runBlocking {
+            Net.post(prefs.base(), "/api/device/location", payload,
+                mapOf("client_id" to prefs.clientId, "token" to prefs.token))
+        }
+        return if (code == 200)
+            "ok" to "координаты отправлены: %.5f, %.5f".format(best.latitude, best.longitude)
+        else "error" to "не удалось отправить координаты (код $code)"
     }
 
     private fun notify(title: String, text: String): Pair<String, String> {

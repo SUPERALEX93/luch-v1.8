@@ -239,6 +239,52 @@ def main_test() -> int:
     check("просроченное подтверждение не выполняется", len(executed) == 1,
           f"выполнено: {executed}")
 
+    print("\n-- валидация аргументов ИИ-команд --")
+    # terminal(command, timeout=60) — command обязателен
+    try:
+        ai._bind_ai_args("terminal", {})
+        check("пустые аргументы при обязательном параметре → ошибка", False,
+              "ValueError не поднят: команда упала бы TypeError внутри")
+    except ValueError as exc:
+        check("пустые аргументы при обязательном параметре → ошибка",
+              "нужны аргументы" in str(exc), f"{exc}")
+
+    try:
+        ai._bind_ai_args("terminal", {"command": "ls", "таймаут": 5})
+        check("частично незнакомые аргументы → ошибка", False,
+              "раскладка по порядку подставила бы мусор в чужой параметр")
+    except ValueError as exc:
+        check("частично незнакомые аргументы → ошибка", "нет аргументов" in str(exc), f"{exc}")
+
+    # обратная совместимость: старый позиционный стиль (ни одного знакомого имени)
+    try:
+        positional = ai._bind_ai_args("terminal", {"команда": "ls"})
+        check("старый позиционный стиль ещё работает", positional == {"command": "ls"},
+              f"{positional}")
+    except ValueError as exc:
+        check("старый позиционный стиль ещё работает", False, f"{exc}")
+
+    try:
+        bound = ai._bind_ai_args("terminal", {"command": "ls"})
+        check("верные имена аргументов принимаются", bound == {"command": "ls"}, f"{bound}")
+    except ValueError as exc:
+        check("верные имена аргументов принимаются", False, f"{exc}")
+
+    sig = {a["name"]: a for a in ai._ai_command_signature("phone_vibrate")}
+    if "ms" in sig:
+        check("тип числового аргумента не выдаётся за str",
+              sig["ms"]["type"] == "int", f"type={sig['ms']['type']!r}")
+    else:
+        check("phone_vibrate найден в реестре", False, f"аргументы: {list(sig)}")
+
+    # parse_ai_command обязан пережить неверные аргументы и записать ошибку
+    history_before = len(ai.web_ai_command_history(limit=1000))
+    rc = ai.parse_ai_command('command {"command": "terminal", "args": {}}')
+    history_after = len(ai.web_ai_command_history(limit=1000))
+    check("parse_ai_command переживает неверные аргументы", rc == 0, f"вернулось {rc!r}")
+    check("ошибка аргументов попала в журнал", history_after > history_before,
+          f"было {history_before}, стало {history_after}")
+
     print("\n-- Итог --")
     print(f"  пройдено: {len(PASSED)}")
     print(f"  провалено: {len(FAILED)}")

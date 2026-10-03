@@ -1235,11 +1235,23 @@ command {"command": "название_команды", "args": {"аргумен�
             if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
                 continue
             required = param.default is param.empty
+            # Тип берём из аннотации, а не всегда "str": иначе схема на сайте
+            # обещает строку там, где функция ждёт число.
+            annotation = param.annotation
+            if annotation is inspect.Parameter.empty or annotation is None:
+                if required or param.default is None:
+                    type_name = "str"
+                else:
+                    type_name = type(param.default).__name__
+            elif isinstance(annotation, str):
+                type_name = annotation
+            else:
+                type_name = getattr(annotation, "__name__", str(annotation))
             out.append({
                 "name": pname,
                 "required": required,
                 "default": None if required else param.default,
-                "type": type(param.default).__name__ if not required else "str",
+                "type": type_name,
             })
         return out
 
@@ -1303,16 +1315,43 @@ command {"command": "название_команды", "args": {"аргумен�
 
         Не перечисленные необязательные аргументы не передаём вовсе, чтобы сработали
         значения по умолчанию из самой функции.
+
+        Ошибки агента не «додумываем»: если обязательный аргумент не передан или
+        часть имён не совпала с сигнатурой, бросаем ValueError с понятным текстом.
+        Раньше пустой args считался «всё совпало» и команда падала TypeError внутри,
+        а частичное совпадение молча раскладывалось по порядку — значения попадали
+        в чужие параметры.
         """
         spec = self._ai_command_signature(name)
         names = [a["name"] for a in spec]
+        required = [a["name"] for a in spec if a["required"]]
         args = dict(args or {})
+
         if not names:
+            if args:
+                raise ValueError("команда «%s» не принимает аргументов, а переданы: %s"
+                                 % (name, ", ".join(args)))
             return {}
+
+        if not args:
+            if required:
+                raise ValueError("команде «%s» нужны аргументы: %s" % (name, ", ".join(required)))
+            return {}
+
         if all(k in names for k in args):
             return dict(args)                      # имена верные — порядок не важен
-        # имена не совпали (старый позиционный стиль) — раскладываем по порядку сигнатуры
+
+        if any(k in names for k in args):
+            # Часть имён знакома, часть нет — это ошибка агента, а не позиционный
+            # стиль. Молчаливая раскладка по порядку подставила бы мусор.
+            unknown = [k for k in args if k not in names]
+            raise ValueError("у команды «%s» нет аргументов: %s (доступны: %s)"
+                             % (name, ", ".join(unknown), ", ".join(names)))
+
+        # Ни одного знакомого имени — старый позиционный стиль.
         values = list(args.values())
+        if len(values) < len(required):
+            raise ValueError("команде «%s» нужны аргументы: %s" % (name, ", ".join(required)))
         return dict(zip(names, values))
 
     def _invoke_ai_command(self, name, kwargs, limit):
