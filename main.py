@@ -281,6 +281,7 @@ class AIconsole:
         "reload_libs": "instant",
         "help": "instant",
         "clear": "instant",
+        "web_token": "instant",
         "restart_server": "restart",
         "exit": "danger",
     }
@@ -353,11 +354,18 @@ class AIconsole:
         self._banner()
         # Токен сгенерирован впервые — без него веб-панель не пустит никого,
         # поэтому показываем его один раз прямо в консоли.
+        token = settings.settings.get("web_token", "")
         if getattr(settings, "web_token_generated", False):
             print(Fore.YELLOW + "\n 🔑 Сгенерирован web_token для доступа к веб-панели:" + Style.RESET_ALL)
-            print(Fore.CYAN + f"    {settings.settings.get('web_token', '')}" + Style.RESET_ALL)
+            print(Fore.CYAN + f"    {token}" + Style.RESET_ALL)
             print(Fore.YELLOW + "    Введи его в панели CONFIG на сайте (поле web_token). "
                                 "Он также сохранён в settings.json.\n" + Style.RESET_ALL)
+        elif token:
+            # Токен создан при прошлом запуске, поэтому показать его было негде,
+            # а без него веб-панель не пускает. Подсказываем, где его взять.
+            print(Fore.YELLOW + f"\n 🔑 Веб-панель требует web_token. Показать: /web_token"
+                                f" (или пункт меню «Показать web_token»)."
+                                f" Он сохранён в settings.json.\n" + Style.RESET_ALL)
         self.whisper_model = settings.settings["whispermodel"]
         self.micro_index = settings.settings["micro_index"]
         self.tts_voice = settings.settings["tts_voice"]
@@ -398,6 +406,7 @@ class AIconsole:
             "reload_libs": [self.reload_libs, "Перезагрузить настройки и модули"],
             "help": [self._show_help, "Показать список всех команд"],
             "clear": [self.clear_console, "Очистить экран консоли"],
+            "web_token": [self.show_web_token, "Показать web_token для веб-панели"],
             "menu": [self.open_menu, "Открыть это меню"],
             "exit": [work_fuctions.exit, "Выйти из программы"],
         }
@@ -410,7 +419,7 @@ class AIconsole:
             ("🧠 МОДЕЛЬ И ПРОВАЙДЕР ИИ", ["ai"]),
             ("🎙 ГОЛОС И РАСПОЗНАВАНИЕ РЕЧИ", ["tts_voice", "change_speed_ai_voice", "trigger_word",
                                           "change_voice_profile", "change_stt_mode", "whisper_model", "micro"]),
-            ("🔧 СИСТЕМА", ["settings", "restart_server", "reload_libs", "clear", "help"]),
+            ("🔧 СИСТЕМА", ["settings", "web_token", "restart_server", "reload_libs", "clear", "help"]),
             ("🚪 ВЫХОД", ["exit"]),
         ]
 
@@ -1845,6 +1854,18 @@ command {"command": "название_команды", "args": {"аргумен�
             tensor = resampler(tensor)
 
         self.profile_tensor = tensor
+
+    def show_web_token(self):
+        """Показать web_token: без него веб-панель никого не пускает."""
+        token = settings.settings.get("web_token", "")
+        if not token:
+            print(Fore.RED + "Токен не создан — он появится при следующем запуске." + Style.RESET_ALL)
+            return
+        # Токен — пароль от веб-панели, поэтому печатаем его по запросу,
+        # а не молча при каждом старте.
+        print(Fore.CYAN + "\n 🔑 web_token для веб-панели:" + Style.RESET_ALL)
+        print(Fore.CYAN + f"    {token}\n" + Style.RESET_ALL)
+        print("    Открой http://<ip>:1337 и вставь его в панели CONFIG (поле web_token)." + Style.RESET_ALL)
 
     def show_settings(self):
         lines = Text()

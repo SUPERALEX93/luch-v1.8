@@ -189,6 +189,25 @@ def main_test() -> int:
     check("/exit выставляет should_exit", ai.should_exit is True)
     check("should_exit взводит событие", ai._exit_event.is_set())
 
+    # Токен должен быть доступен по команде: иначе на существующей установке
+    # его негде взять, а веб-панель без него никого не пускает.
+    check("/web_token есть в списке команд", "web_token" in ai.user_commands)
+    check("/web_token не блокируется вебом",
+          main.AIconsole.COMMAND_MODES.get("web_token") == "instant")
+    shown = []
+    # print в модуле не задан, поэтому подменяем атрибут и убираем его обратно
+    main.print = lambda *a, **k: shown.append(" ".join(str(x) for x in a))
+    try:
+        ai.user_commands["web_token"][0]()
+    finally:
+        del main.print
+    token = main.settings.settings.get("web_token", "")
+    check("/web_token печатает сам токен",
+          bool(token) and token in " ".join(shown), f"напечатано: {shown}")
+    check("/web_token не путает токен с zen_api_key",
+          main.settings.settings.get("zen_api_key", "") not in " ".join(shown),
+          "напечатан посторонний ключ")
+
     print("\n-- маскировка секретов --")
     info = ai.web_settings_info()
     check("zen_api_key замаскирован",
@@ -197,11 +216,29 @@ def main_test() -> int:
           isinstance(info.get("web_token"), dict) and info["web_token"].get("hidden") is True)
     providers = info.get("ai_providers")
     check("ai_providers не отдан открытым текстом", isinstance(providers, list))
-    if isinstance(providers, list) and providers:
-        first = providers[0]
+    # Маскировку вложенного ключа проверяем на подставном провайдере: на чистой
+    # копии репозитория у пользователя ни одного провайдера нет, и проверка
+    # молча пропускалась — то есть секрет мог бы утечь незаметно для тестов.
+    saved_providers = main.settings.settings.get("ai_providers")
+    main.settings.settings["ai_providers"] = [{
+        "name": "__probe__", "base_url": "https://example.invalid/v1",
+        "api_key": "sekret-probe-123", "model": "probe-model",
+    }]
+    try:
+        probed = ai.web_settings_info().get("ai_providers")
+        first = probed[0] if isinstance(probed, list) and probed else {}
         check("вложенный api_key замаскирован",
               isinstance(first.get("api_key"), dict) and first["api_key"].get("hidden") is True,
               f"api_key = {first.get('api_key')!r}")
+        check("значение вложенного ключа не утекло",
+              "sekret-probe-123" not in str(probed),
+              "ключ провайдера виден в web_settings_info()")
+        check("имя и адрес провайдера остаются читаемыми",
+              first.get("name") == "__probe__"
+              and first.get("base_url") == "https://example.invalid/v1",
+              f"пробник искажён: {first!r}")
+    finally:
+        main.settings.settings["ai_providers"] = saved_providers
     check("приватные поля провайдера не утекли",
           "SUPER_SECRET" not in str(info) and bool(settings.settings.get("zen_api_key", "")) is False
           or settings.settings.get("zen_api_key", "") not in str(info),
