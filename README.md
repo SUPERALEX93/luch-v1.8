@@ -96,6 +96,8 @@ python gui_launcher.py
 - `GET /api/health` — проверка живости, без секретов
 - `/api/device/register|queue|result|ping|location` — телефон аутентифицируется
   собственным токеном устройства (`client_id` + `token`)
+- `/api/voice` — принимает **либо** `X-Luch-Token` (браузер), **либо** пару
+  `client_id` + `token` в query-параметрах (телефон, который веб-токена не знает)
 
 **Всё остальное** — только с `X-Luch-Token`.
 
