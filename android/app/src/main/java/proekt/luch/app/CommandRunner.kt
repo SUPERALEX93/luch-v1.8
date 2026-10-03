@@ -21,6 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger
 class CommandRunner(private val context: Context) {
 
     private val notifSeq = AtomicInteger(1000)
+    private val notifIds = java.util.concurrent.ConcurrentHashMap<String, Int>()
     private val phone = PhoneControl(context)
     private val prefs = Prefs(context)
     private var ringing: Ringtone? = null
@@ -98,7 +99,9 @@ class CommandRunner(private val context: Context) {
             return "error" to "уведомления запрещены — разрешите их ЛУЧ в настройках Android"
         }
         val body = if (text.isNotEmpty()) text else "Пустое уведомление"
-        val id = notifSeq.incrementAndGet()
+        // ID стабилен для одного заголовка: повторные уведомления заменяют друг
+        // друга. Раньше ID только рос, и уведомления копились бесконечно.
+        val id = notifIds.getOrPut(title) { notifSeq.incrementAndGet() }
         val intent = Intent(context, MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
         val pending = android.app.PendingIntent.getActivity(
@@ -145,13 +148,18 @@ class CommandRunner(private val context: Context) {
         runCatching { am.setStreamVolume(AudioManager.STREAM_ALARM, am.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0) }
         runCatching { am.setStreamVolume(AudioManager.STREAM_RING, am.getStreamMaxVolume(AudioManager.STREAM_RING), 0) }
         val ringtone = RingtoneManager.getRingtone(context, uri)
+        // Гасим предыдущий звонок: иначе два рингтона накладываются друг на друга.
+        runCatching { ringing?.stop() }
         ringing = ringtone
         runCatching { ringtone.play() }
         Thread {
             Thread.sleep(8000)
             runCatching { ringtone.stop() }
-            ringing = null
-        }.start()
+            // Сбрасываем ссылку, только если это всё ещё НАШ звонок. Иначе поток
+            // старого звонка обнулял бы ссылку на новый, и stop_ring не смог бы
+            // его остановить — телефон продолжал бы звонить.
+            synchronized(this) { if (ringing === ringtone) ringing = null }
+        }.apply { isDaemon = true }.start()
         return "ok" to "телефон звонит 8 секунд"
     }
 

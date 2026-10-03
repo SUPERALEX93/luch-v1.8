@@ -617,8 +617,16 @@ command {"command": "название_команды", "args": {"аргумен�
         self.save_custom_provider("", base, settings.settings.get("ai_api_key") or "",
                                   settings.settings.get("ai_model") or "",
                                   settings.settings.get("ai_timeout") or 120)
-        entry = self.custom_providers()[-1]
-        settings.settings["ai_providers"] = self.custom_providers()
+        providers = self.custom_providers()
+        if not providers:
+            return
+        # Ищем именно тот провайдер, который перенесли, а не «последний в списке»:
+        # save_custom_provider мог обновить существующую запись, и [-1] указал бы
+        # на совсем другого провайдера.
+        normalized = base.rstrip("/")
+        entry = next((p for p in providers
+                      if (p.get("base_url") or "").rstrip("/") == normalized), providers[-1])
+        settings.settings["ai_providers"] = providers
         settings.settings["ai_active"] = entry["id"]
         settings.save_settings()
         print(Fore.GREEN + "кастомный провайдер перенесён в список: %s"
@@ -2603,7 +2611,10 @@ command {"command": "название_команды", "args": {"аргумен�
             self.global_context += "\nUSER:  " + self.user_prompt
             if len(self.global_context) > 1000:
                 us_metka = self.global_context.find("USER:")
-                self.global_context = self.global_context[us_metka:]
+                # find() возвращает -1, и срез [-1:] оставил бы один последний символ
+                # вместо контекста. Метки может не быть, если строка обрезана.
+                if us_metka >= 0:
+                    self.global_context = self.global_context[us_metka:]
         if "заблокируй компьютер" in self.user_prompt or "заблокируй пк" in self.user_prompt or "заблокируй комп" in self.user_prompt:
             work_fuctions.lock_pc()
             self.user_prompt = None

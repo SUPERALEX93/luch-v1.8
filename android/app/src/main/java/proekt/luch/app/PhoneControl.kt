@@ -69,7 +69,16 @@ class PhoneControl(private val ctx: Context) {
                     Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
         return try {
             ctx.startActivity(i)
-            "ok" to "экран включён, приложение открыто"
+            // startActivity из фона НЕ бросает исключение на Android 10+, даже если
+            // система молча запретила показ. Поэтому «ok» говорим только когда
+            // активность уже жива и действительно выходит вперёд; иначе честно
+            // предупреждаем, что запрос мог быть отброшен системой.
+            if (act != null) {
+                "ok" to "экран включён, приложение открыто"
+            } else {
+                "ok" to "запрос на открытие отправлен; если приложение не появилось — " +
+                        "разрешите ЛУЧ автозапуск в фоне (Android 10+ блокирует его)"
+            }
         } catch (e: Exception) {
             "error" to "не смог разбудить экран: ${e.message ?: e.javaClass.simpleName}"
         }
@@ -223,8 +232,17 @@ class PhoneControl(private val ctx: Context) {
         return try {
             if (get) {
                 val cur = cm.primaryClip?.getItemAt(0)?.coerceToText(ctx)?.toString().orEmpty()
-                if (cur.isEmpty()) "ok" to "буфер обмена пуст"
-                else "ok" to "в буфере: $cur"
+                if (cur.isNotEmpty()) {
+                    "ok" to "в буфере: $cur"
+                } else {
+                    // На Android 10+ буфер отдаётся только приложению с фокусом окна,
+                    // поэтому null не означает «пусто». Раньше здесь всегда говорилось
+                    // «буфер обмена пуст», и пользователь не понимал, почему.
+                    val focused = MainActivity.instance?.get()?.hasWindowFocus() == true
+                    if (focused) "ok" to "буфер обмена пуст"
+                    else "error" to "Android отдаёт буфер только активному приложению — " +
+                            "откройте ЛУЧ на экране и повторите"
+                }
             } else {
                 if (text.isNullOrBlank()) return "error" to "не передал текст для буфера"
                 cm.setPrimaryClip(ClipData.newPlainText("ЛУЧ", text))
