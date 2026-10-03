@@ -3,18 +3,22 @@
 Серверная часть «моста» между ИИ и телефоном:
   * реестр устройств: у каждого свой client_id и токен, они не связаны с web_token;
   * очередь команд с монотонным seq — телефон забирает и отвечает тем же seq;
-  * маршрутизация «телефон или ПК» по тексту промта пользователя.
+  * выбор устройства и сводка для ИИ (маршрутизацию по тексту промта делает сам ИИ).
 
 Телефон лежит в той же локальной сети, что и сервер, поэтому транспорт простой:
 HTTP-опрос раз в несколько секунд. Очередь серверная, поэтому позже её можно
 перевести на WebSocket, не меняя ничего здесь.
 """
-import re
+import copy
+import json
+import logging
 import secrets
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 # ── Реестр устройств ────────────────────────────────────────────────────────
 # devices[client_id] = {
@@ -25,18 +29,28 @@ devices = {}
 devices_lock = threading.RLock()
 
 # ── Очередь команд для телефонов ────────────────────────────────────────────
-# queue[client_id] = [{"seq", "id", "command", "args", "created"}]
+# queue[client_id] = [{"seq", "id", "command", "args", "created", "created_ts"}]
 queue = {}
-results = {}          # cmd_id -> {"client_id", "status", "output", "at"}
+# Результаты адресуются парой (client_id, cmd_id). Глобальный cmd_id угадываем,
+# поэтому без привязки к клиенту чужое устройство могло бы подсунуть свой вывод.
+results = {}          # (client_id, cmd_id) -> {"client_id","status","output","at","at_ts"}
+_acked = {}           # client_id -> последний seq, подтверждённый в submit()
+_waiters = {}         # (client_id, cmd_id) -> threading.Event ожидающего enqueue()
 _seq = [0]
+
+# Порядок блокировок всегда один: devices_lock -> _seq_lock. Обратный порядок
+# запрещён (взаимная блокировка), поэтому все функции берут их только так.
+_seq_lock = threading.RLock()
 
 # Устройства и их токены должны переживать перезапуск сервера, иначе телефон
 # пришлось бы регистрировать заново при каждом запуске.
 DEVICES_FILE = Path(__file__).resolve().parent / "devices.json"
-_seq_lock = threading.RLock()
 
 MAX_QUEUE = 50        # сколько команд ждать ответа на одном устройстве
-RESULT_TTL = 900     # 15 минут, потом результат считается протухшим
+RESULT_TTL = 900      # 15 минут: старше — результат считается протухшим
+COMMAND_TTL = 180     # 3 минуты: недоставленная команда старше — протухла и выкидывается
+RESULTS_MAX = 500     # жёсткий предел таблицы результатов (на случай всплеска)
+MAX_OUTPUT = 4000     # предел вывода телефона, который уходит в контекст ИИ
 
 # Что телефон умеет. capabilities приходят от приложения при регистрации.
 KNOWN_CAPS = ("location", "notify", "vibrate", "open_url", "ring", "battery",
@@ -49,44 +63,89 @@ def _now():
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _mark_seen(dev):
+    """Отметить связь: ISO-время для файла и веб-интерфейса + epoch для быстрой проверки."""
+    dev["last_seen"] = _now()
+    dev["last_seen_ts"] = time.time()
+
+
 def _is_online(dev, offline_after=90):
-    """Устройство считается онлайн, если polled недавно."""
-    last = dev.get("last_seen")
-    if not last:
-        return False
+    """Устройство считается онлайн, если polled недавно.
+
+    Горячий путь (опрос очереди раз в 2-3 с и цикл ожидания в enqueue) не должен
+    каждый раз парсить ISO. Если epoch-кэша нет, разбираем ISO один раз и кэшируем.
+    """
+    ts = dev.get("last_seen_ts")
+    if ts is None:
+        last = dev.get("last_seen")
+        if not last:
+            return False
+        try:
+            ts = datetime.fromisoformat(last).timestamp()
+        except (ValueError, TypeError):
+            return False
+        dev["last_seen_ts"] = ts
     try:
-        return (datetime.now() - datetime.fromisoformat(last)).total_seconds() < offline_after
-    except (ValueError, TypeError):
+        return (time.time() - float(ts)) < offline_after
+    except (TypeError, ValueError):
         return False
 
 
 def register_device(name="Телефон", kind="android", token=None, caps=None,
                     model=None, os_version=None, client_id=None):
-    """Зарегистрировать устройство. Возвращает client_id и его токен."""
-    caps = [c for c in (caps or []) if c in KNOWN_CAPS] or ["location", "notify", "vibrate"]
+    """Зарегистрировать устройство. Возвращает client_id и его токен.
+
+    Повторная регистрация существующего client_id разрешена только тому, кто
+    доказал владение текущим токеном (сравнение постоянного времени). Иначе любой
+    желающий по угаданному client_id перезаписал бы запись и украл токен.
+    """
+    # Новому устройству при пустых caps достаётся безопасный минимум; у уже
+    # зарегистрированного пустой список означает «ничего не меняем», иначе
+    # пропущенные caps затирали бы реальные возможности телефона.
+    caps = [c for c in (caps or []) if c in KNOWN_CAPS]
+    fallback_caps = caps or ["location", "notify", "vibrate"]
     with devices_lock:
         if client_id and client_id in devices:
             dev = devices[client_id]
-            dev.update({"name": name or dev["name"], "caps": caps,
-                        "model": model, "os": os_version, "last_seen": _now()})
+            own = str(dev.get("token") or "")
+            given = str(token or "")
+            # У записи ПК токена нет вовсе; удалённая перерегистрация такой
+            # записи (в т.ч. pc) запрещена — иначе её можно было бы переписать.
+            if not own or not given or not secrets.compare_digest(
+                    own.encode("utf-8"), given.encode("utf-8")):
+                raise PermissionError("устройство с таким client_id уже зарегистрировано")
+            # Обновляем только явно переданные поля, не понижая устройство.
+            if name:
+                dev["name"] = name
+            if caps:
+                dev["caps"] = caps
+            if model:
+                dev["model"] = model
+            if os_version:
+                dev["os"] = os_version
+            _mark_seen(dev)
         else:
             client_id = client_id or "dev_" + secrets.token_hex(4)
+            now = _now()
             dev = {
                 "id": client_id, "name": name or "Телефон", "kind": kind or "android",
                 "token": token or secrets.token_urlsafe(24),
-                "caps": caps, "model": model, "os": os_version,
+                "caps": fallback_caps, "model": model, "os": os_version,
                 "battery": None, "lat": None, "lng": None, "accuracy": None,
-                "location_at": None, "last_seen": _now(), "created": _now(),
+                "location_at": None, "last_seen": now, "last_seen_ts": time.time(),
+                "created": now,
             }
             devices[client_id] = dev
-        queue.setdefault(client_id, [])
+        with _seq_lock:
+            queue.setdefault(client_id, [])
     save_devices()
     return {"client_id": dev["id"], "token": dev["token"], "name": dev["name"],
             "caps": dev["caps"]}
 
 
 def check_token(client_id, token):
-    dev = devices.get(client_id)
+    with devices_lock:
+        dev = devices.get(client_id)
     if not dev:
         return False
     own = str(dev.get("token") or "")
@@ -100,21 +159,25 @@ def check_token(client_id, token):
 
 
 def save_devices():
-    """Записать реестр на диск. Файл с токенами — только владельцу."""
+    """Записать реестр на диск. Файл с токенами — только владельцу.
+
+    Под блокировкой делаем только глубокую копию, а сериализацию и запись — уже
+    без неё: иначе диск и chmod тормозили бы каждый запрос. Ошибку глотаем и
+    логируем: падать в обработчике запроса из-за файла нельзя.
+    """
     try:
-        import json
         with devices_lock:
-            payload = {"_seq": _seq[0], "devices": devices}
-            DEVICES_FILE.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+            with _seq_lock:
+                payload = {"_seq": _seq[0], "devices": copy.deepcopy(devices)}
+        text = json.dumps(payload, ensure_ascii=False, indent=1)
+        DEVICES_FILE.write_text(text, encoding="utf-8")
         DEVICES_FILE.chmod(0o600)
-    except OSError:
-        pass
+    except Exception as exc:                      # noqa: BLE001 — файл не должен ронять запрос
+        _log.warning("не удалось сохранить %s: %s", DEVICES_FILE, exc)
 
 
 def load_devices():
     """Поднять реестр после перезапуска сервера."""
-    import json
     try:
         raw = json.loads(DEVICES_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -133,30 +196,50 @@ def load_devices():
             if str(cid).startswith("_"):
                 continue
             if isinstance(dev, dict) and dev.get("id"):
+                # Ключ карты — истина: list_devices ищет по dev["id"], и без
+                # принудительной синхронизации мог бы получить None.
+                dev["id"] = cid
+                if not isinstance(dev.get("caps"), list):
+                    dev["caps"] = []
+                # Прогреваем epoch-кэш, чтобы _is_online не парсил ISO на каждом опросе.
+                if "last_seen_ts" not in dev:
+                    try:
+                        dev["last_seen_ts"] = datetime.fromisoformat(
+                            dev.get("last_seen") or "").timestamp()
+                    except (ValueError, TypeError):
+                        dev["last_seen_ts"] = 0.0
                 # last_seen с прошлого запуска — телефон считается не на связи
                 devices[cid] = dev
+        with _seq_lock:
+            for cid in devices:
                 queue.setdefault(cid, [])
-        _seq[0] = max(_seq[0], saved_seq)
+            _seq[0] = max(_seq[0], saved_seq)
 
 
 def device_info(client_id):
     """Данные устройства без токена — для показа и для ИИ."""
-    dev = devices.get(client_id)
-    if not dev:
-        return None
-    return {
-        "id": dev["id"], "name": dev["name"], "kind": dev["kind"],
-        "caps": dev["caps"], "model": dev.get("model"), "os": dev.get("os"),
-        "battery": dev.get("battery"), "online": _is_online(dev),
-        "last_seen": dev.get("last_seen"), "created": dev.get("created"),
-        "lat": dev["lat"], "lng": dev["lng"], "accuracy": dev.get("accuracy"),
-        "location_at": dev.get("location_at"),
-        "pending": len(queue.get(client_id, [])),
-    }
+    with devices_lock:
+        dev = devices.get(client_id)
+        if not dev:
+            return None
+        info = {
+            "id": dev.get("id") or client_id, "name": dev.get("name") or client_id,
+            "kind": dev.get("kind"), "caps": list(dev.get("caps") or []),
+            "model": dev.get("model"), "os": dev.get("os"),
+            "battery": dev.get("battery"), "online": _is_online(dev),
+            "last_seen": dev.get("last_seen"), "created": dev.get("created"),
+            "lat": dev.get("lat"), "lng": dev.get("lng"),
+            "accuracy": dev.get("accuracy"), "location_at": dev.get("location_at"),
+        }
+        with _seq_lock:
+            info["pending"] = len(queue.get(client_id, []))
+    return info
 
 
 def list_devices():
-    return [device_info(dev["id"]) for dev in list(devices.values())]
+    with devices_lock:
+        ids = list(devices)
+    return [d for d in (device_info(cid) for cid in ids) if d]
 
 
 def forget_device(client_id):
@@ -164,54 +247,67 @@ def forget_device(client_id):
         if client_id not in devices:
             return {"status": "error", "message": "устройство не найдено"}
         devices.pop(client_id)
-        queue.pop(client_id, None)
+        with _seq_lock:
+            queue.pop(client_id, None)
+            _acked.pop(client_id, None)
     save_devices()
     return {"status": "ok", "message": "устройство %s забыто" % client_id}
 
 
 def rename_device(client_id, name):
-    dev = devices.get(client_id)
-    if not dev:
-        return {"status": "error", "message": "устройство не найдено"}
-    dev["name"] = (name or "").strip()[:40] or dev["name"]
+    with devices_lock:
+        dev = devices.get(client_id)
+        if not dev:
+            return {"status": "error", "message": "устройство не найдено"}
+        dev["name"] = (name or "").strip()[:40] or dev.get("name") or client_id
+        new_name = dev["name"]
     save_devices()
-    return {"status": "ok", "name": dev["name"]}
+    return {"status": "ok", "name": new_name}
 
 
 def touch(client_id, battery=None):
     """Отметить, что устройство только что было на связи."""
-    dev = devices.get(client_id)
-    if not dev:
-        return None
-    dev["last_seen"] = _now()
-    if battery is not None:
-        try:
-            dev["battery"] = int(battery)
-        except (TypeError, ValueError):
-            pass
+    with devices_lock:
+        dev = devices.get(client_id)
+        if not dev:
+            return None
+        _mark_seen(dev)
+        if battery is not None:
+            try:
+                dev["battery"] = int(battery)
+            except (TypeError, ValueError):
+                pass
     return dev
 
 
 def report_location(client_id, lat, lng, accuracy=None):
-    dev = devices.get(client_id)
-    if not dev:
-        return {"status": "error", "message": "устройство не зарегистрировано"}
-    try:
-        dev["lat"], dev["lng"] = float(lat), float(lng)
-        dev["accuracy"] = float(accuracy) if accuracy is not None else None
-    except (TypeError, ValueError):
-        return {"status": "error", "message": "некорректные координаты"}
-    dev["location_at"] = _now()
-    dev["last_seen"] = _now()
+    with devices_lock:
+        dev = devices.get(client_id)
+        if not dev:
+            return {"status": "error", "message": "устройство не зарегистрировано"}
+        try:
+            lat_f, lng_f = float(lat), float(lng)
+            acc_f = float(accuracy) if accuracy is not None else None
+        except (TypeError, ValueError):
+            return {"status": "error", "message": "некорректные координаты"}
+        dev["lat"], dev["lng"], dev["accuracy"] = lat_f, lng_f, acc_f
+        dev["location_at"] = _now()
+        _mark_seen(dev)
+        name = dev.get("name") or "android"
     # Телефон — это клиент ЛУЧ, поэтому его координаты должны попасть в общую
     # геолокацию: от неё зависят геокод, маршруты, рядом и история перемещений.
+    # Внешний вызов делаем без блокировки и не глотаем ошибку молча.
     try:
         import work_fuctions
-        work_fuctions.update_location(dev["lat"], dev["lng"], dev["accuracy"],
-                                      source="phone:" + str(dev.get("name") or "android"))
-    except Exception:
-        pass
-    return {"status": "ok", "lat": dev["lat"], "lng": dev["lng"]}
+        work_fuctions.update_location(lat_f, lng_f, acc_f,
+                                      source="phone:" + str(name))
+    except (ImportError, AttributeError, TypeError, ValueError, KeyError,
+            OSError, RuntimeError) as exc:
+        _log.warning("координаты телефона не попали в общую геолокацию: %s", exc)
+        return {"status": "ok", "lat": lat_f, "lng": lng_f, "location_saved": False,
+                "message": "координаты телефона приняты, но в общую геолокацию "
+                           "не записались: %s" % exc}
+    return {"status": "ok", "lat": lat_f, "lng": lng_f, "location_saved": True}
 
 
 # ── Очередь команд ──────────────────────────────────────────────────────────
@@ -222,137 +318,209 @@ def _next_seq():
         return _seq[0]
 
 
+def _res_key(client_id, cmd_id):
+    """Ключ результата: команда привязана к устройству, а не только к cmd_id."""
+    return (str(client_id), str(cmd_id))
+
+
+def _command_age(cmd):
+    """Возраст команды в секундах; 0, если время неизвестно."""
+    ts = cmd.get("created_ts")
+    if ts is None:
+        created = cmd.get("created")
+        if not created:
+            return 0.0
+        try:
+            ts = datetime.fromisoformat(created).timestamp()
+        except (ValueError, TypeError):
+            return 0.0
+    try:
+        return time.time() - float(ts)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _prune_queue_locked(client_id):
+    """Выкинуть протухшие команды. Вызывать ТОЛЬКО под _seq_lock."""
+    pend = queue.get(client_id)
+    if not pend:
+        return
+    alive = [c for c in pend if _command_age(c) < COMMAND_TTL]
+    if len(alive) != len(pend):
+        queue[client_id] = alive
+
+
+def _drop_command_locked(client_id, cmd_id):
+    """Убрать команду из очереди. Вызывать ТОЛЬКО под _seq_lock."""
+    pend = queue.get(client_id)
+    if not pend:
+        return
+    queue[client_id] = [c for c in pend if str(c["id"]) != str(cmd_id)]
+
+
+def _store_result_locked(client_id, cmd_id, status, output, extra=None):
+    """Положить результат и вернуть Event ожидающего enqueue (если он есть).
+
+    Вызывать ТОЛЬКО под _seq_lock.
+    """
+    key = _res_key(client_id, cmd_id)
+    entry = {"client_id": client_id, "status": status, "output": output,
+             "at": _now(), "at_ts": time.time()}
+    if extra:
+        entry.update(extra)
+    results[key] = entry
+    return _waiters.get(key)
+
+
 def enqueue(client_id, command, args=None, wait=15):
     """Отправить команду телефону. Ждёт ответа до wait секунд."""
-    dev = devices.get(client_id)
-    if not dev:
-        return {"status": "error", "message": "устройство %s не найдено" % client_id}
-    if command not in dev.get("caps", []):
+    with devices_lock:
+        dev = devices.get(client_id)
+        if not dev:
+            return {"status": "error", "message": "устройство %s не найдено" % client_id}
+        dev_name = dev.get("name") or client_id
+        dev_caps = list(dev.get("caps") or [])
+    if command not in dev_caps:
         return {"status": "error",
                 "message": "устройство «%s» не умеет «%s». Умеет: %s"
-                           % (dev["name"], command, ", ".join(dev["caps"]) or "ничего")}
+                           % (dev_name, command, ", ".join(dev_caps) or "ничего")}
+
+    # Event, который submit() выставит сразу после сохранения результата: ожидание
+    # перестаёт быть sleep-опросом и не занимает поток лишние 15-30 секунд.
+    ev = threading.Event()
     with _seq_lock:
-        item = {"seq": _next_seq(), "id": "c%d" % _seq[0], "command": command,
-                "args": args or {}, "created": _now()}
-        queue.setdefault(client_id, []).append(item)
-        while len(queue[client_id]) > MAX_QUEUE:
-            queue[client_id].pop(0)
+        seq = _next_seq()
+        item = {"seq": seq, "id": "c%d" % seq, "command": command,
+                "args": args or {}, "created": _now(), "created_ts": time.time()}
+        _prune_queue_locked(client_id)
+        q = queue.setdefault(client_id, [])
+        q.append(item)
+        # Переполнение: оставляем вытеснение самого старого, но не молча — его
+        # ожидающий enqueue получает явную ошибку «очередь переполнена».
+        while len(q) > MAX_QUEUE:
+            dropped = q.pop(0)
+            d_ev = _store_result_locked(client_id, dropped["id"], "error",
+                                        "команда отброшена: очередь переполнена",
+                                        {"queue_full": True})
+            if d_ev is not None:
+                d_ev.set()
+        key = _res_key(client_id, item["id"])
+        _waiters[key] = ev
 
     # Счётчик seq обязан пережить перезапуск: телефон помнит, какие команды уже
     # видел, и при откате счётчика новые команды он больше никогда не заберёт.
     save_devices()
 
     deadline = time.time() + max(0.5, float(wait or 15))
-    while time.time() < deadline:
-        got = results.get(item["id"])
-        if got:
-            return {"status": got.get("status", "ok"), "output": got.get("output", ""),
-                    "device": dev["name"], "command": command, "waited": True}
-        if not _is_online(dev, offline_after=30):
-            return {"status": "error", "offline": True,
-                    "message": "устройство «%s» не на связи — команда не доставлена" % dev["name"]}
-        time.sleep(0.4)
-    return {"status": "error", "timeout": True,
-            "message": "устройство «%s» не ответило за %s с" % (dev["name"], int(wait or 15))}
+    try:
+        while time.time() < deadline:
+            got = results.get(key)
+            if got:
+                return {"status": got.get("status", "ok"), "output": got.get("output", ""),
+                        "device": dev_name, "command": command, "waited": True}
+            if not _is_online(dev, offline_after=30):
+                return {"status": "error", "offline": True,
+                        "message": "устройство «%s» не на связи — команда не доставлена" % dev_name}
+            ev.wait(0.4)
+        return {"status": "error", "timeout": True,
+                "message": "устройство «%s» не ответило за %s с" % (dev_name, int(wait or 15))}
+    finally:
+        # Команда не дождалась ответа (офлайн/таймаут) — убираем её из очереди,
+        # иначе телефон выполнит её позже (ring/dial/open_url) и pending останется раздутым.
+        with _seq_lock:
+            _waiters.pop(key, None)
+            _drop_command_locked(client_id, item["id"])
 
 
 def take(client_id, since=0, limit=20):
     """Забрать команды для телефона.
 
-    since — последний seq, который телефон уже обработал. Всё, что не дождалось
-    ответа (сеть моргнула, процесс убили), возвращается заново: пока команда
-    висит в очереди, она важнее любого since, иначе она застрянет навсегда.
+    since — последний seq, который телефон уже обработал. Возвращаемый seq — это
+    acked_seq, который растёт ТОЛЬКО в submit(): пока команда не подтверждена,
+    сервер не говорит телефону «ты догнал». Незавершённые команды остаются в
+    очереди и отдаются заново, поэтому потеря upload'а результата не теряет команду.
     """
-    pend = queue.get(client_id) or []
     since_i = int(since or 0)
-    # Телефон помнит seq больше, чем счётчик сервера, только если сервер потерял
-    # состояние (файл удалён или откатился). Тогда фильтр по since отбрасывал бы
-    # всё, и команды застряли бы навсегда — сбрасываем фильтр и отдаём очередь.
-    reset = since_i > _seq[0]
-    fresh = [c for c in pend if reset or c["seq"] > since_i][:int(limit or 20)]
-    top = max([0 if reset else since_i] + [c["seq"] for c in pend])
-    return {"commands": fresh, "seq": top, "reset": reset}
+    with _seq_lock:
+        _prune_queue_locked(client_id)
+        pend = list(queue.get(client_id) or [])
+        # Телефон помнит seq больше, чем счётчик сервера, только если сервер потерял
+        # состояние (файл удалён или откатился). Тогда фильтр по since отбрасывал бы
+        # всё, и команды застряли бы навсегда — сбрасываем фильтр и отдаём очередь.
+        reset = since_i > _seq[0]
+        # В очереди лежат ровно неподтверждённые команды: отдаём их все (с учётом
+        # limit), а не только те, что выше since, иначе команда с меньшим seq
+        # застряла бы, если более поздняя уже подтверждена.
+        fresh = pend[:int(limit or 20)]
+        acked = int(_acked.get(client_id, 0))
+    return {"commands": fresh, "seq": acked, "reset": reset}
 
 
 def submit(client_id, cmd_id, status="ok", output=""):
     """Телефон прислал результат выполненной команды."""
-    results[str(cmd_id)] = {"client_id": client_id, "status": status,
-                            "output": output, "at": _now()}
+    # Вывод телефона уходит в контекст ИИ, поэтому режем его до разумного предела.
+    out = output if isinstance(output, str) else str(output or "")
+    if len(out) > MAX_OUTPUT:
+        out = out[:MAX_OUTPUT] + "\n…[вывод обрезан, всего %d символов]" % len(out)
+    key = _res_key(client_id, cmd_id)
     with _seq_lock:
         pend = queue.get(client_id) or []
-        queue[client_id] = [c for c in pend if str(c["id"]) != str(cmd_id)]
-    # чистим протухшие результаты
-    if len(results) > 200:
-        for cid in list(results)[:-200]:
-            results.pop(cid, None)
+        # Команда обязана принадлежать очереди именно этого устройства: иначе
+        # чужой client_id мог бы подсунуть вывод в ожидающий enqueue другого телефона.
+        item = next((c for c in pend if str(c["id"]) == str(cmd_id)), None)
+        if item is None:
+            return {"status": "error",
+                    "message": "команда %s не найдена в очереди устройства" % cmd_id}
+        _acked[client_id] = max(int(_acked.get(client_id, 0)), int(item.get("seq") or 0))
+        ev = _store_result_locked(client_id, cmd_id, status, out)
+        _drop_command_locked(client_id, cmd_id)
+    if ev is not None:
+        ev.set()
+    _gc_results()
     return {"status": "ok"}
 
 
 def _gc_results():
-    """Вызывается периодически: удалить старые результаты."""
+    """Удалить протухшие результаты. Вызывается из submit()."""
     now = time.time()
-    for cid in list(results):
-        entry = results[cid]
-        try:
-            age = now - datetime.fromisoformat(entry["at"]).timestamp()
-        except (ValueError, TypeError, KeyError):
-            age = 0
-        if age > RESULT_TTL:
-            results.pop(cid, None)
+    with _seq_lock:
+        for key in list(results):
+            entry = results[key]
+            ts = entry.get("at_ts")
+            if ts is None:
+                try:
+                    ts = datetime.fromisoformat(entry["at"]).timestamp()
+                except (ValueError, TypeError, KeyError):
+                    ts = now
+            try:
+                age = now - float(ts)
+            except (TypeError, ValueError):
+                age = 0
+            if age > RESULT_TTL:
+                results.pop(key, None)
+        # Жёсткий потолок на случай всплеска: выкидываем самые старые по вставке.
+        if len(results) > RESULTS_MAX:
+            for key in list(results)[:len(results) - RESULTS_MAX]:
+                results.pop(key, None)
 
 
-# ── Маршрутизация «телефон или ПК» по промту ────────────────────────────────
-
-PHONE_WORDS = ("телефон", "телефона", "телефоне", "телефону", "смартфон", "андроид",
-               "android", "мобил", "мобильн", "на телефоне", "мою телефон", "мой телефон")
-PC_WORDS = ("комп", "компьютер", "компьютера", "пк", "pc", "десктоп", "ноутбук",
-            "ноут", "laptop", "десктопа", "на компе", "на пк")
-
-
-def _norm(text):
-    return re.sub(r"\s+", " ", str(text or "").lower().replace("ё", "е"))
-
+# ── Выбор устройства и сводка для ИИ ────────────────────────────────────────
+# Раньше здесь жили resolve_target/PHONE_WORDS/PC_WORDS, но маршрутизацию по
+# тексту промта делает сам ИИ (см. COMMANDS_HELP), и вызывающих у них нет.
 
 def online_devices(kind=None):
+    with devices_lock:
+        ids = list(devices)
     out = []
-    for cid, dev in devices.items():
-        if kind and dev.get("kind") != kind:
+    for cid in ids:
+        info = device_info(cid)
+        if not info:
             continue
-        if _is_online(dev):
-            out.append(device_info(cid))
+        if kind and info.get("kind") != kind:
+            continue
+        if info.get("online"):
+            out.append(info)
     return out
-
-
-def resolve_target(target, prompt=""):
-    """Определить, к чему относится просьба: телефон, ПК или оба.
-
-    target: 'auto' | 'phone' | 'pc' | 'both' — что сказал сам ИИ.
-    prompt: текст промта пользователя — по нему гадаем, если ИИ не уточнил.
-    """
-    t = _norm(target)
-    p = _norm(prompt)
-
-    if t in ("phone", "android", "phone_only"):
-        return "phone"
-    if t in ("pc", "computer", "desktop", "pc_only"):
-        return "pc"
-    if t == "both" or t == "все":
-        return "both"
-
-    phone_hit = any(w in p for w in PHONE_WORDS)
-    pc_hit = any(w in p for w in PC_WORDS)
-    if phone_hit and not pc_hit:
-        return "phone"
-    if pc_hit and not phone_hit:
-        return "pc"
-    if phone_hit and pc_hit:
-        return "both"
-
-    # промт неоднозначен: если онлайн ровно одно устройство — оно и есть
-    on = online_devices()
-    if len(on) == 1:
-        return "phone" if on[0]["kind"] == "android" else "pc"
-    return "pc"          # по умолчанию — компьютер, где работает сервер
 
 
 # ── Команды для ИИ ───────────────────────────────────────────────────────────
@@ -367,20 +535,29 @@ def _one_phone():
 
 def _status(summary):
     """Короткая сводка по устройствам — попадает в ответ ИИ."""
-    if not devices:
-        return {"status": "error",
-                "message": "Ни одного телефона не подключено. Поставь Android-приложение LUCH "
-                           "и открой его — устройство появится здесь автоматически."}
+    listed = list_devices()
     parts = []
-    for d in list_devices():
-        bits = ["%s (%s)" % (d["name"], "на связи" if d["online"] else "не на связи")]
+    for d in listed:
+        bits = ["%s (%s)" % (d.get("name") or d.get("id"),
+                             "на связи" if d.get("online") else "не на связи")]
         if d.get("battery") is not None:
-            bits.append("батарея %d%%" % d["battery"])
+            try:
+                bits.append("батарея %d%%" % int(d["battery"]))
+            except (TypeError, ValueError):
+                bits.append("батарея %s" % d["battery"])
         if d.get("lat") is not None:
             bits.append("координаты есть, %s" % d.get("location_at"))
         parts.append(", ".join(bits))
-    return {"status": "ok", "summary": summary + " | " + " ; ".join(parts),
-            "devices": list_devices()}
+    # register_desktop() всегда кладёт запись «pc», поэтому проверка «нет устройств»
+    # была недостижима. Нас интересует отсутствие именно телефонов; перечень
+    # устройств (например, одного ПК) при этом сохраняется.
+    full = summary + (" | " + " ; ".join(parts) if parts else "")
+    if not any(d.get("kind") == "android" for d in listed):
+        return {"status": "error",
+                "message": "Ни одного телефона не подключено. Поставь Android-приложение LUCH "
+                           "и открой его — устройство появится здесь автоматически.",
+                "summary": full, "devices": listed}
+    return {"status": "ok", "summary": full, "devices": listed}
 
 
 def _need_phone():
@@ -436,7 +613,17 @@ def phone_battery(target="auto"):
     dev, err = _need_phone()
     if err:
         return {"status": "error", "message": err}
-    return _status("Батарея «%s»: %s" % (dev["name"], dev.get("battery")))
+    name = dev.get("name") or dev.get("id") or "телефон"
+    bat = dev.get("battery")
+    if bat is None:
+        return {"status": "ok", "device": name, "battery": None,
+                "message": "Телефон «%s» ещё не сообщал заряд батареи." % name}
+    try:
+        value = int(bat)
+    except (TypeError, ValueError):
+        value = None
+    return {"status": "ok", "device": name, "battery": bat,
+            "summary": "Батарея «%s»: %s%s" % (name, bat, "%" if value is not None else "")}
 
 
 def devices_list():
@@ -458,20 +645,28 @@ def phone_location():
 
 
 def register_desktop(name="Этот компьютер"):
-    """ПК сам себя объявляет, чтобы ИИ видел оба устройства в одном списке."""
+    """ПК сам себя объявляет, чтобы ИИ видел оба устройства в одном списке.
+
+    Это единственное место, где создаётся запись «pc» (с пустым токеном), поэтому
+    register_device не должен принимать удалённую перерегистрацию tokenless-записи.
+    """
     with devices_lock:
         if "pc" in devices:
             dev = devices["pc"]
-            dev.update({"name": name, "last_seen": _now()})
+            dev["name"] = name
+            _mark_seen(dev)
         else:
+            now = _now()
             devices["pc"] = {
                 "id": "pc", "name": name, "kind": "pc", "token": "",
                 "caps": ["terminal", "system", "browser", "location"],
                 "model": None, "os": "linux", "battery": None,
                 "lat": None, "lng": None, "accuracy": None,
-                "location_at": None, "last_seen": _now(), "created": _now(),
+                "location_at": None, "last_seen": now, "last_seen_ts": time.time(),
+                "created": now,
             }
-        queue.setdefault("pc", [])
+        with _seq_lock:
+            queue.setdefault("pc", [])
     return device_info("pc")
 
 
