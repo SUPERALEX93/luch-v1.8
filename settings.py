@@ -1,5 +1,7 @@
 from pathlib import Path
 import json
+import os
+import secrets
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -22,6 +24,7 @@ default_settings = {"model": "",
                     "ai_providers": [],
                     "ai_active": "",
                     "web_token": "",
+                    "confirm_dangerous": True,
                     "whispermodel":"", 
                     "micro_index": 1, 
                     "tts_voice": "xenia", 
@@ -31,15 +34,47 @@ default_settings = {"model": "",
                     "stt_mode":"google"
                     }
 
+# True, если при последнем get_settings_from_file() был сгенерирован новый web_token.
+# Нужно, чтобы вызывающий код мог один раз показать токен пользователю.
+web_token_generated = False
+
+
+def _write_settings_file(path, data):
+    """Атомарно записать настройки и закрыть файл правами 0o600.
+
+    Токен веб-доступа лежит в settings.json, поэтому временный файл тоже сразу
+    получает права владельца — иначе он на миг был бы доступен всем.
+    """
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False, indent=4)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def get_settings_from_file():
+    global web_token_generated
+    web_token_generated = False
     path = Path(PATHS["settings_path"])
     if path.is_file():
+        loaded = {}
         try:
             with open(path, "r", encoding="utf-8") as file:
                 loaded = json.load(file)
             if not isinstance(loaded, dict):
                 raise ValueError("ожидался объект JSON")
-        except Exception as e:
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            # Файл действительно повреждён (не парсится или это не объект JSON) —
+            # только тогда откладываем его как .broken. OSError/PermissionError сюда
+            # не попадают: при временной недоступности файл трогать нельзя, иначе
+            # здоровые настройки теряются из-за разового сбоя или гонки чтения.
             print(f"Ошибка чтения настроек ({path}): {e}")
             backup = path.with_suffix(".json.broken")
             try:
@@ -48,30 +83,43 @@ def get_settings_from_file():
             except Exception:
                 pass
             loaded = {}
+        except OSError as e:
+            # Временная ошибка доступа/чтения: файл НЕ переименовываем, просто
+            # возвращаем значения по умолчанию.
+            print(f"Настройки временно недоступны ({path}): {e}")
+            return dict(default_settings)
         merged = dict(default_settings)
         merged.update(loaded)
-        return merged
     else:
+        merged = dict(default_settings)
+
+    # Пароль веб-API обязан существовать: пустой токен = открытый доступ к API.
+    # Генерируем и сразу сохраняем (модульного settings здесь ещё нет),
+    # вызывающий код узнаёт о генерации по web_token_generated.
+    if not merged.get("web_token"):
+        merged["web_token"] = secrets.token_urlsafe(24)
+        web_token_generated = True
         try:
-            with open(path, "w", encoding="utf-8") as file:
-                json.dump(default_settings, file, ensure_ascii=False, indent=4)
-        except Exception as e:
-            print(f"Ошибка создания настроек: {e}")
-        return dict(default_settings)
+            _write_settings_file(path, merged)
+        except OSError as e:
+            print(f"Ошибка сохранения web_token: {e}")
+    return merged
+
 
 def save_settings():
     path = Path(PATHS["settings_path"])
     tmp = path.with_suffix(".json.tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as file:
-            json.dump(settings, file, ensure_ascii=False, indent=4)
-        tmp.replace(path)
+        _write_settings_file(path, settings)
+        return True
     except Exception as e:
         print(f"Ошибка сохранения настроек: {e}")
         try:
             tmp.unlink(missing_ok=True)
         except Exception:
             pass
+        return False
+
 
 settings = get_settings_from_file()
 

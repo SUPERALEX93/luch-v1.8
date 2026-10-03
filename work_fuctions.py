@@ -9,7 +9,7 @@ import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from colorama import Fore, Back, Style
+from colorama import Fore, Style
 from ddgs import DDGS
 
 import device_control
@@ -17,10 +17,30 @@ import device_control
 # --- Связь с основным процессом и вебом ---
 tts_callback = None  # Сюда main.py передаст функцию генерации голоса ИИ
 web_alerts = []      # Очередь уведомлений для веб-интерфейса
+_alerts_lock = threading.Lock()   # web_alerts пишется из нескольких потоков
+_WEB_ALERTS_MAX = 100             # держим только свежие уведомления
+last_err = None      # последняя ошибка вспомогательных действий (для диагностики)
+
+
+def _push_alert(description):
+    """Потокобезопасно добавить уведомление в web_alerts (не длиннее _WEB_ALERTS_MAX).
+
+    web_alerts остаётся обычным списком: web_server.py читает его через
+    .copy()/.clear() и ожидает именно такой тип.
+    """
+    try:
+        with _alerts_lock:
+            web_alerts.append({"description": description})
+            if len(web_alerts) > _WEB_ALERTS_MAX:
+                del web_alerts[: len(web_alerts) - _WEB_ALERTS_MAX]
+    except Exception:
+        pass
+
 
 # --- Журнал важных событий (пишется в файл, а не в консоль) ---
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 _log_lock = threading.Lock()
+_LOG_COMPACT_MIN_BYTES = 65536  # ниже этого размера файл не сжимаем
 
 
 def log_event(name, text, keep=500, alert=None):
@@ -35,18 +55,26 @@ def log_event(name, text, keep=500, alert=None):
         with _log_lock:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
             path = LOG_DIR / f"{name}.log"
+            # Обычная работа — только дописываем строку. Полная перезапись файла
+            # (сжатие до последних keep строк) выполняется редко, когда он вырос.
             with open(path, "a", encoding="utf-8") as f:
                 f.write(f"{stamp}  {text}\n")
-            lines = path.read_text(encoding="utf-8").splitlines()
-            if len(lines) > keep:
-                path.write_text("\n".join(lines[-keep:]) + "\n", encoding="utf-8")
+            try:
+                limit = max(int(keep), 1)
+            except (TypeError, ValueError):
+                limit = 500
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            if size > max(limit * 200, _LOG_COMPACT_MIN_BYTES):
+                lines = path.read_text(encoding="utf-8").splitlines()
+                if len(lines) > limit:
+                    path.write_text("\n".join(lines[-limit:]) + "\n", encoding="utf-8")
     except Exception:
         pass
     if alert:
-        try:
-            web_alerts.append({"description": alert})
-        except Exception:
-            pass
+        _push_alert(alert)
 
 # --- Модуль геолокации / навигатора ---
 # Хранит последние координаты клиента, историю и флаг запроса позиции.
@@ -55,6 +83,7 @@ location_data = dict(LOCATION_DEFAULT)   # текущая позиция кли�
 route_data = None                        # точка назначения: {"lat":.., "lng":.., "label":..}
 location_history = []                    # история перемещений (список позиций)
 location_request_pending = False         # если True — фронт должен прислать свежие координаты
+_location_lock = threading.Lock()        # защищает location_data/location_history от гонок
 
 _GEO_UA = "LUCH-AI/1.7 (voice assistant; geolocation tracker)"
 
@@ -67,23 +96,24 @@ def update_location(lat, lng, accuracy=None, source="web"):
         lng = float(lng)
     except (TypeError, ValueError):
         return "ERROR: invalid coordinates."
-    prev = dict(location_data)   # копия ДО обновления (иначе ссылалась бы на тот же словарь)
-    location_data.update({
-        "lat": lat,
-        "lng": lng,
-        "accuracy": float(accuracy) if accuracy is not None else None,
-        "timestamp": datetime.now().isoformat(),
-        "source": source,
-    })
-    # Шум: не спамим историю одинаковыми точками
-    if prev.get("lat") is not None:
-        if haversine(prev["lat"], prev["lng"], lat, lng) > 2.0:
+    with _location_lock:
+        prev = dict(location_data)   # копия ДО обновления (иначе ссылалась бы на тот же словарь)
+        location_data.update({
+            "lat": lat,
+            "lng": lng,
+            "accuracy": float(accuracy) if accuracy is not None else None,
+            "timestamp": datetime.now().isoformat(),
+            "source": source,
+        })
+        # Шум: не спамим историю одинаковыми точками
+        if prev.get("lat") is not None:
+            if haversine(prev["lat"], prev["lng"], lat, lng) > 2.0:
+                location_history.append(dict(location_data))
+        else:
             location_history.append(dict(location_data))
-    else:
-        location_history.append(dict(location_data))
-    # Ограничение истории, чтобы она не росла без предела
-    if len(location_history) > 5000:
-        del location_history[: len(location_history) - 5000]
+        # Ограничение истории, чтобы она не росла без предела
+        if len(location_history) > 5000:
+            del location_history[: len(location_history) - 5000]
     return "LOCATION UPDATED"
 
 
@@ -109,9 +139,54 @@ def haversine(lat1, lng1, lat2, lng2):
     return 2 * radius * math.asin(math.sqrt(a))
 
 
+# ---- Кэш и лимит частоты для Nominatim ----
+# Nominatim требует не более 1 запроса в секунду, а геокодирование вызывается
+# часто (get_my_location/build_route), поэтому успешные ответы кэшируем на 5 минут.
+_GEO_CACHE_TTL = 300.0
+_geo_cache = {}
+_geo_cache_lock = threading.Lock()
+_GEO_MIN_INTERVAL = 1.1
+_geo_rate_lock = threading.Lock()
+_geo_last_request = [0.0]
+
+
+def _geo_rate_limit():
+    """Выдержать паузу, чтобы не превысить лимит Nominatim (<= 1 запрос/с)."""
+    with _geo_rate_lock:
+        wait = _GEO_MIN_INTERVAL - (time.monotonic() - _geo_last_request[0])
+        if wait > 0:
+            time.sleep(wait)
+        _geo_last_request[0] = time.monotonic()
+
+
+def _geo_cache_get(key):
+    with _geo_cache_lock:
+        item = _geo_cache.get(key)
+        if not item:
+            return None
+        ts, value = item
+        if time.monotonic() - ts > _GEO_CACHE_TTL:
+            _geo_cache.pop(key, None)
+            return None
+        return value
+
+
+def _geo_cache_put(key, value):
+    with _geo_cache_lock:
+        _geo_cache[key] = (time.monotonic(), value)
+        if len(_geo_cache) > 500:   # чистим самые старые записи
+            for old_key, _ in sorted(_geo_cache.items(), key=lambda kv: kv[1][0])[:100]:
+                _geo_cache.pop(old_key, None)
+
+
 def geocode(query):
     """Геокодирование: текстовый адрес/место → координаты (Nominatim/OSM)."""
+    cache_key = ("geocode", str(query).strip().lower())
+    cached = _geo_cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
+        _geo_rate_limit()
         r = http_requests.get(
             "https://nominatim.openstreetmap.org/search",
             params={"q": query, "format": "json", "limit": 3, "addressdetails": 0},
@@ -126,7 +201,9 @@ def geocode(query):
              "type": d.get("type") or d.get("class")}
             for d in data[:3]
         ]
-        return {"status": "ok", "query": query, "results": results}
+        result = {"status": "ok", "query": query, "results": results}
+        _geo_cache_put(cache_key, result)
+        return result
     except Exception as e:
         return {"status": "error", "message": f"Ошибка геокодирования: {e}"}
 
@@ -137,7 +214,12 @@ def reverse_geocode(lat, lng):
         lat, lng = float(lat), float(lng)
     except (TypeError, ValueError):
         return {"status": "error", "message": "Некорректные координаты."}
+    cache_key = ("reverse", round(lat, 5), round(lng, 5))
+    cached = _geo_cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
+        _geo_rate_limit()
         r = http_requests.get(
             "https://nominatim.openstreetmap.org/reverse",
             params={"lat": lat, "lon": lng, "format": "json", "zoom": 18, "addressdetails": 1},
@@ -152,8 +234,10 @@ def reverse_geocode(lat, lng):
             if addr.get(key):
                 parts.append(addr[key])
         precise = ", ".join(parts) or (d.get("display_name") or "адрес не определён")
-        return {"status": "ok", "lat": lat, "lng": lng,
-                "address": precise, "house": addr.get("house_number"), "road": addr.get("road")}
+        result = {"status": "ok", "lat": lat, "lng": lng,
+                  "address": precise, "house": addr.get("house_number"), "road": addr.get("road")}
+        _geo_cache_put(cache_key, result)
+        return result
     except Exception as e:
         return {"status": "error", "message": f"Ошибка обратного геокодирования: {e}"}
 
@@ -239,7 +323,36 @@ navigation_data = {
     "early_announced": set(),
     "started_at": None,
 }
-_nav_stop_evt = threading.Event()
+# Текущий запуск навигатора: поток и ЕГО СОБСТВЕННОЕ стоп-событие.
+# Отдельное событие на каждый запуск важно: раньше set()+clear() был импульсом,
+# который устаревший цикл мог пропустить и продолжал озвучивать манёвры вечно.
+_nav_run = {"thread": None, "stop": None}
+
+# Словари подсказок вынесены на уровень модуля: _maneuver_text вызывается
+# каждые 3 секунды на каждый активный цикл навигации.
+_MANEUVER_ACTIONS = {
+    "departure": "начали движение",
+    "arrival": "вы прибыли в пункт назначения",
+    "turn": "поверните",
+    "continue": "продолжайте движение",
+    "merge": "вливайтесь в поток",
+    "fork": "держитесь",
+    "end of road": "в конце дороги поверните",
+    "roundabout": "двигайтесь по кругу",
+    "roundabout turn": "по кругу поверните",
+    "new name": "продолжайте движение",
+    "on ramp": "выезжайте на съезд",
+    "off ramp": "сверните на съезд",
+    "use lane": "держите свою полосу",
+    "restricted": "двигайтесь по разрешённому маршруту",
+    "uturn": "развернитесь",
+}
+_MANEUVER_DIRS = {
+    "left": "налево", "right": "направо",
+    "sharp left": "резко налево", "sharp right": "резко направо",
+    "slight left": "плавно налево", "slight right": "плавно направо",
+    "straight": "прямо", "uturn": "развернитесь",
+}
 
 
 def _maneuver_text(step):
@@ -248,33 +361,10 @@ def _maneuver_text(step):
     typ = m.get("type")
     mod = m.get("modifier")
     name = step.get("name") or ""
-    actions = {
-        "departure": "начали движение",
-        "arrival": "вы прибыли в пункт назначения",
-        "turn": "поверните",
-        "continue": "продолжайте движение",
-        "merge": "вливайтесь в поток",
-        "fork": "держитесь",
-        "end of road": "в конце дороги поверните",
-        "roundabout": "двигайтесь по кругу",
-        "roundabout turn": "по кругу поверните",
-        "new name": "продолжайте движение",
-        "on ramp": "выезжайте на съезд",
-        "off ramp": "сверните на съезд",
-        "use lane": "держите свою полосу",
-        "restricted": "двигайтесь по разрешённому маршруту",
-        "uturn": "развернитесь",
-    }
-    dirs = {
-        "left": "налево", "right": "направо",
-        "sharp left": "резко налево", "sharp right": "резко направо",
-        "slight left": "плавно налево", "slight right": "плавно направо",
-        "straight": "прямо", "uturn": "развернитесь",
-    }
     if typ == "arrival":
-        return actions["arrival"]
-    act = actions.get(typ, "продолжайте движение")
-    direction = dirs.get(mod, "")
+        return _MANEUVER_ACTIONS["arrival"]
+    act = _MANEUVER_ACTIONS.get(typ, "продолжайте движение")
+    direction = _MANEUVER_DIRS.get(mod, "")
     text = f"{act} {direction}".strip()
     if name and typ not in ("departure",):
         text += f" на {name}"
@@ -298,10 +388,13 @@ def _find_next_maneuver(loc_lat, loc_lng):
     return None, None, None
 
 
-def _nav_loop():
-    """Фоновый цикл навигатора: следит за позицией и озвучивает манёвры."""
-    global navigation_data
-    while not _nav_stop_evt.wait(3):
+def _nav_loop(stop_evt):
+    """Фоновый цикл навигатора: следит за позицией и озвучивает манёвры.
+
+    stop_evt — событие ИМЕННО ЭТОГО запуска: цикл продолжается, пока не взведено
+    его собственное событие, поэтому устаревшие циклы гарантированно завершаются.
+    """
+    while not stop_evt.wait(3):
         loc = get_location()
         if loc.get("lat") is None:
             continue
@@ -347,9 +440,16 @@ def start_navigation(destination):
     route = build_route(destination)
     if route.get("status") != "ok":
         return route
-    # останавливаем предыдущую навигацию, если была
-    _nav_stop_evt.set()
-    _nav_stop_evt.clear()
+    # Останавливаем предыдущую навигацию: взводим ЕЁ событие и ждём завершения,
+    # иначе старый цикл продолжит жить и дублировать голосовые подсказки.
+    prev_stop = _nav_run.get("stop")
+    prev_thread = _nav_run.get("thread")
+    if prev_stop is not None:
+        prev_stop.set()
+    if prev_thread is not None and prev_thread.is_alive():
+        prev_thread.join(timeout=3.5)
+    stop_evt = threading.Event()
+    _nav_run["stop"] = stop_evt
     navigation_data.update({
         "active": True,
         "destination": destination,
@@ -361,7 +461,8 @@ def start_navigation(destination):
         "early_announced": set(),
         "started_at": datetime.now().isoformat(),
     })
-    t = threading.Thread(target=_nav_loop, daemon=True)
+    t = threading.Thread(target=_nav_loop, args=(stop_evt,), daemon=True)
+    _nav_run["thread"] = t
     t.start()
     first = _next_maneuver_summary()
     return {
@@ -385,18 +486,20 @@ def _next_maneuver_summary():
         return m
     if navigation_data.get("steps"):
         # первый значимый манёвр маршрута
-        for s in navigation_data["steps"]:
+        for i, s in enumerate(navigation_data["steps"]):
             mm = s.get("maneuver", {})
             if mm.get("type") not in ("departure",):
                 loc = mm.get("location", [None, None])
                 if loc[0] is not None:
-                    return {"text": _maneuver_text(s), "distance_m": None, "index": 0}
+                    return {"text": _maneuver_text(s), "distance_m": None, "index": i}
     return None
 
 
 def stop_navigation():
     """Остановить голосовую навигацию."""
-    _nav_stop_evt.set()
+    stop_evt = _nav_run.get("stop")
+    if stop_evt is not None:
+        stop_evt.set()
     navigation_data.update({"active": False, "next_maneuver": None})
     return {"status": "navigation_stopped"}
 
@@ -415,7 +518,6 @@ def navigation_status():
                 continue
             mlat, mlng = float(lat[1]), float(lat[0])
             dist = haversine(loc["lat"], loc["lng"], mlat, mlng)
-            remaining = m.get("duration", 0) + steps[i].get("duration", 0)
             remaining_m = int(dist)
             current = {"text": _maneuver_text(steps[i]), "distance_m": int(dist)}
             break
@@ -464,7 +566,10 @@ def _overpass_query(query_body, timeout=25):
         except Exception as e:
             last_err = e
             continue
-    raise last_err
+    # Нельзя raise None: если ни одно зеркало не ответило, поднимаем реальное исключение
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("Overpass API недоступен")
 
 
 def nearby(what, radius=2000):
@@ -476,7 +581,15 @@ def nearby(what, radius=2000):
         radius = max(100, min(int(radius), 20000))
     except (TypeError, ValueError):
         radius = 2000
-    escaped = str(what).replace("\\", "\\\\").replace('"', '\\"')
+    # Режем слишком длинный запрос и экранируем спецсимволы Overpass QL
+    # (обратный слэш, кавычки, переводы строк), чтобы нельзя было сломать запрос.
+    what_text = str(what).strip()[:200]
+    if not what_text:
+        return {"status": "error", "message": "Пустой запрос поиска рядом."}
+    escaped = (what_text.replace("\\", "\\\\")
+                        .replace('"', '\\"')
+                        .replace("\n", " ")
+                        .replace("\r", " "))
     q = (
         f'[out:json][timeout:20];'
         f'(node["name"~"{escaped}",i](around:{radius},{loc["lat"]},{loc["lng"]});'
@@ -492,9 +605,10 @@ def nearby(what, radius=2000):
         try:
             dlat = radius / 111000.0
             dlng = radius / (111000.0 * math.cos(math.radians(loc["lat"])))
+            _geo_rate_limit()
             r = http_requests.get(
                 "https://nominatim.openstreetmap.org/search",
-                params={"q": what, "format": "json", "limit": 8, "bounded": 1,
+                params={"q": what_text, "format": "json", "limit": 8, "bounded": 1,
                         "viewbox": f"{loc['lng']-dlng},{loc['lat']-dlat},{loc['lng']+dlng},{loc['lat']+dlat}"},
                 headers={"User-Agent": _GEO_UA}, timeout=20,
             )
@@ -503,7 +617,7 @@ def nearby(what, radius=2000):
             for item in r.json():
                 elems.append({
                     "lat": float(item["lat"]), "lon": float(item["lon"]),
-                    "tags": {"name": item.get("display_name", what).split(",")[0],
+                    "tags": {"name": item.get("display_name", what_text).split(",")[0],
                              "amenity": item.get("type") or "place"},
                     "dist_m": haversine(loc["lat"], loc["lng"], float(item["lat"]), float(item["lon"])),
                 })
@@ -512,7 +626,7 @@ def nearby(what, radius=2000):
 
     if not elems:
         return {"status": "error",
-                "message": f"Не найдено мест по запросу '{what}' в радиусе {radius} м."}
+                "message": f"Не найдено мест по запросу '{what_text}' в радиусе {radius} м."}
     spots = []
     for el in elems:
         lat = el.get("lat")
@@ -526,29 +640,33 @@ def nearby(what, radius=2000):
         if metric is None:
             metric = haversine(loc["lat"], loc["lng"], lat, lng)
         spots.append({
-            "name": t.get("name") or what,
+            "name": t.get("name") or what_text,
             "category": t.get("amenity") or t.get("shop") or t.get("tourism") or t.get("leisure") or "place",
             "distance_m": round(metric),
             "lat": lat, "lng": lng,
         })
-    spots = [s for s in spots if s["name"].lower() != what.lower().strip()]
+    spots = [s for s in spots if s["name"].lower() != what_text.lower()]
     spots = sorted(spots, key=lambda s: s["distance_m"])[:8]
     if not spots:
-        return {"status": "error", "message": f"Рядом с тобой нет мест с именем '{what}'."}
-    return {"status": "ok", "query": what, "radius_m": radius,
+        return {"status": "error", "message": f"Рядом с тобой нет мест с именем '{what_text}'."}
+    return {"status": "ok", "query": what_text, "radius_m": radius,
             "center": {"lat": loc["lat"], "lng": loc["lng"]}, "spots": spots}
 
 
 def analyze_movement():
     """Анализ истории перемещений: трек, длина пути, диапазон времени, текущая точка."""
-    if not location_history or location_history[-1].get("lat") is None:
+    # Снимок под замком: update_location может менять и обрезать историю прямо
+    # во время обхода, а fixes = location_history был бы лишь псевдонимом списка.
+    with _location_lock:
+        fixes = [dict(p) for p in location_history]
+    if not fixes or fixes[-1].get("lat") is None:
         return {"status": "error",
                 "message": "История перемещений пуста. Клиент ещё ни разу не присылал координаты (нужна открытая карта)."}
     total = 0.0
     prev = None
     unique_pts = 0
     prev_bucket = None
-    for p in location_history:
+    for p in fixes:
         if p.get("lat") is None:
             prev = None; prev_bucket = None; continue
         cur_bucket = (round(p["lat"], 4), round(p["lng"], 4))
@@ -558,7 +676,6 @@ def analyze_movement():
         if prev is not None:
             total += haversine(prev["lat"], prev["lng"], p["lat"], p["lng"])
         prev = p
-    fixes = location_history
     return {
         "status": "ok",
         "points_count": len([p for p in fixes if p.get("lat") is not None]),
@@ -586,17 +703,25 @@ def navigator_status():
     return navigation_status()
 
 
+# navigator / stop_navigator / navigator_status — публичные алиасы функций
+# start_navigation / stop_navigation / navigation_status (оставлены для совместимости).
+
+
 def web_search(request):
     with DDGS() as ddgs:
         return list(ddgs.text(request, max_results=10))
 
-def terminal(command):
+def terminal(command, timeout=60):
     if not command or not command.strip():
         return ""
     try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
+        # shell=True нужен намеренно: пользователь просит произвольные команды.
+        # encoding/errors фиксируем явно — при locale-декодировании русский вывод
+        # (CPython 3.14) иначе может упасть с UnicodeDecodeError.
+        result = subprocess.run(command, shell=True, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
-        return "ОШИБКА: команда превысила лимит времени 60 секунд."
+        return f"ОШИБКА: команда превысила лимит времени {timeout} секунд."
     except Exception as e:
         return f"ОШИБКА: {e}"
     out = (result.stdout or "").strip()
@@ -607,6 +732,7 @@ def terminal(command):
     return out or ""
 
 def exit():
+    # Имя намеренно совпадает с main.py (commands_ai["exit"]) — не переименовывать.
     print(Fore.GREEN + "EXIT" + Style.RESET_ALL)
     sys.exit(0)
 
@@ -644,6 +770,7 @@ def _run_quiet(cmd, timeout=8):
     """Запустить команду и вернуть (returncode, вывод). Ничего не печатает."""
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
                               timeout=timeout, start_new_session=True)
         return proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()
     except FileNotFoundError:
@@ -728,13 +855,14 @@ def lock_pc():
         return "ЭКРАН ЗАБЛОКИРОВАН: " + how
 
     def try_cmd(cmd, label):
+        """Вернуть сообщение об успехе или пустую строку — тип всегда str."""
         if not shutil.which(cmd[0]):
-            return False
+            return ""
         code, out = _run_quiet(cmd, timeout=8)
         if code == 0:
             return ok(label)
         errors.append(f"{label}: код {code}" + (f" ({out[:120]})" if out else ""))
-        return False
+        return ""
 
     def try_background(cmd, label):
         # hyprlock/swaylock держат экран заблокированным до ввода пароля,
@@ -753,8 +881,9 @@ def lock_pc():
             return ok(result)
         errors.append("Plasma D-Bus: сервис блокировки недоступен")
     elif desktop == "gnome":
-        if try_cmd(["gnome-screensaver-command", "-l"], "gnome-screensaver-command"):
-            return "ЭКРАН ЗАБЛОКИРОВАН: gnome-screensaver-command"
+        msg = try_cmd(["gnome-screensaver-command", "-l"], "gnome-screensaver-command")
+        if msg:
+            return msg
     elif desktop == "hyprland":
         if try_background(["hyprlock"], "hyprlock"):
             return "ЭКРАН ЗАБЛОКИРОВАН: hyprlock"
@@ -762,19 +891,23 @@ def lock_pc():
         if try_background(["swaylock"], "swaylock"):
             return "ЭКРАН ЗАБЛОКИРОВАН: swaylock"
     elif desktop == "xfce":
-        if try_cmd(["xflock4"], "xflock4"):
-            return "ЭКРАН ЗАБЛОКИРОВАН: xflock4"
+        msg = try_cmd(["xflock4"], "xflock4")
+        if msg:
+            return msg
 
     # 2. Универсальные способы
-    if try_cmd(["loginctl", "lock-session"], "loginctl lock-session"):
-        return "ЭКРАН ЗАБЛОКИРОВАН: loginctl lock-session"
+    msg = try_cmd(["loginctl", "lock-session"], "loginctl lock-session")
+    if msg:
+        return msg
     if desktop != "kde":
         for tool in _qdbus_tools():
-            if try_cmd([tool, "org.freedesktop.ScreenSaver",
-                        "/org/freedesktop/ScreenSaver", "Lock"], f"{tool} ScreenSaver"):
-                return f"ЭКРАН ЗАБЛОКИРОВАН: {tool} ScreenSaver"
-    if try_cmd(["xdg-screensaver", "lock"], "xdg-screensaver"):
-        return "ЭКРАН ЗАБЛОКИРОВАН: xdg-screensaver"
+            msg = try_cmd([tool, "org.freedesktop.ScreenSaver",
+                           "/org/freedesktop/ScreenSaver", "Lock"], f"{tool} ScreenSaver")
+            if msg:
+                return msg
+    msg = try_cmd(["xdg-screensaver", "lock"], "xdg-screensaver")
+    if msg:
+        return msg
 
     # 3. Блокировщики compositor'а — только на Wayland, иначе они падают
     if wayland:
@@ -791,12 +924,52 @@ def lock_pc():
 
 
 def print_text(text):
-    subprocess.run(['wtype', text])
+    """Напечатать текст через wtype. Возвращает результат, а не безусловный успех."""
+    global last_err
+    try:
+        proc = subprocess.run(['wtype', text], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=15)
+    except FileNotFoundError:
+        last_err = "wtype не найден"
+        return "ОШИБКА: утилита wtype не найдена (установите wtype)."
+    except subprocess.TimeoutExpired:
+        last_err = "wtype не ответил"
+        return "ОШИБКА: печать текста превысила лимит времени 15 секунд."
+    except Exception as e:
+        last_err = str(e)
+        return f"ОШИБКА: {e}"
+    if proc.returncode != 0:
+        detail = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        last_err = detail or f"код {proc.returncode}"
+        return ("ОШИБКА: не удалось напечатать текст"
+                + (f" ({detail[:200]})" if detail else f" (код {proc.returncode})"))
+    last_err = None
     return "TEXT PRINTED SUCCESSFULLY"
 
 # ---- ТАЙМЕР ----
+# Реестр активных таймеров: позволяет отменить/заменить таймер с тем же описанием
+# и не копить потоки, которые никто не отслеживает.
+_TIMER_RE = re.compile(r'^\+?(\d+)([smh])$')
+_active_timers = {}
+_timers_lock = threading.Lock()
+
+
+def _register_timer(description, timer):
+    """Заменить прежний таймер с тем же описанием и запомнить новый."""
+    with _timers_lock:
+        old = _active_timers.get(description)
+        if old is not None:
+            try:
+                old.cancel()
+            except Exception:
+                pass
+        _active_timers[description] = timer
+
+
 def timer_alert(description):
     print(Fore.RED + f"\n[АЛАРМ!] Сработал таймер: {description}" + Style.RESET_ALL)
+    with _timers_lock:
+        _active_timers.pop(description, None)
 
     try:
         subprocess.run(["notify-send", "-u", "critical", "-t", "10000", "LUCH AI ⏰", description])
@@ -809,7 +982,7 @@ def timer_alert(description):
         tts_callback(description, audio_path)
         
     # 3. Передаем сигнал для веб-интерфейса
-    web_alerts.append({"description": description})
+    _push_alert(description)
 
 def set_timer(timer_type, time_val, description):
     now = datetime.now()
@@ -825,7 +998,7 @@ def set_timer(timer_type, time_val, description):
         except ValueError:
             return "ERROR: invalid absolute time format."
     elif timer_type == "relative":
-        match = re.match(r'^\+?(\d+)([smh])$', time_val.strip().lower())
+        match = _TIMER_RE.match(time_val.strip().lower())
         if match:
             val = int(match.group(1))
             unit = match.group(2)
@@ -838,14 +1011,17 @@ def set_timer(timer_type, time_val, description):
         return "ERROR: invalid timer_type."
 
     t = threading.Timer(delay_seconds, timer_alert, args=[description])
+    t.daemon = True
+    _register_timer(description, t)
     t.start()
     
     return f"TIMER SET SUCCESSFULLY FOR {time_val}"
 
 commands_ai = {
-    "terminal": {"func": terminal, "icon": "🖥️"},
+    # "dangerous": True — команду ИИ нужно подтвердить у пользователя (гейт в main.py).
+    "terminal": {"func": terminal, "icon": "🖥️", "dangerous": True},
     "web_search": {"func": web_search, "icon": "🌐"},
-    "lock_pc": {"func": lock_pc, "icon": "🔒"},
+    "lock_pc": {"func": lock_pc, "icon": "🔒", "dangerous": True},
     "print_text": {"func": print_text, "icon": "✍️"},
     "set_timer": {"func": set_timer, "icon": "⏰"},
     "navigator": {"func": navigator, "icon": "🗺️"},
@@ -983,6 +1159,6 @@ commands_ai_and_args = """
     15. nearby - найти места (заведения, магазины и т.п.) рядом с клиентом по названию. Аргумент "radius" — радиус в метрах (по умолчанию 2000).
     Пример: {"command": "nearby", "args": {"what": "кофейня", "radius": 3000}}.
 
-    13. analyze_movement - проанализировать историю перемещений клиента: сколько точек и уникальных мест, длина трека, временной диапазон.
+    16. analyze_movement - проанализировать историю перемещений клиента: сколько точек и уникальных мест, длина трека, временной диапазон.
     Пример: {"command": "analyze_movement", "args": {}}.
 """ + device_control.COMMANDS_HELP
