@@ -886,12 +886,12 @@
             markBad('cfgBaseUrl', false);
             busy(btn, true);
             try {
-                // POST /api/ai/test принимает {base_url, api_key, model}, но возвращает
-                // только {ok, message} — списка моделей там нет, а новый эндпоинт не вводим.
-                // Поэтому список моделей по-прежнему берём из /api/ai/models (GET),
-                // но через apiGet: запрос обязан уходить с X-Luch-Token.
-                const q = new URLSearchParams({ base_url: url, api_key: $('cfgApiKey').value });
-                const d = await apiGet('/api/ai/models?' + q);
+                // Ключ уходит в ТЕЛЕ POST-запроса, а не в query-строке: URL попадает
+                // в логи сервера, прокси и историю браузера.
+                const d = await apiPost('/api/ai/models', {
+                    base_url: url,
+                    api_key: $('cfgApiKey').value,
+                });
                 if (d.models && d.models.length) {
                     const dl = $('cfgModelList');
                     dl.innerHTML = '';

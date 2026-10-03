@@ -127,7 +127,8 @@ class StubAI:
         return (raw or "").rstrip("/")
 
     def list_ai_models(self, base_url=None, api_key=None):
-        return {"models": []}
+        # Контракт как в main.py: (список_моделей, текст_ошибки)
+        return [], ""
 
     def test_ai_endpoint(self, base_url=None, api_key=None, model=None, text="Привет!"):
         return {"ok": False, "detail": "stub"}
@@ -214,6 +215,7 @@ def main() -> int:
         ("get", "/api/menu", None),
         ("get", "/api/state", None),
         ("post", "/api/ask", {"text": "привет"}),
+        ("post", "/api/ai/models", {"base_url": "", "api_key": ""}),
     ]:
         if method == "get":
             r = client.get(path, headers=AUTH)
@@ -281,6 +283,18 @@ def main() -> int:
     r = client.post("/api/device/result", headers=NOAUTH)
     check("POST /api/device/result без тела → не 500", r.status_code < 500,
           f"код {r.status_code} (AttributeError на data.cmd_id)")
+
+    print("\n-- Секреты не должны попадать в URL --")
+    schema = web_server.app.openapi() or {}
+    paths = schema.get("paths", {})
+    models_get = paths.get("/api/ai/models", {}).get("get", {})
+    get_params = [p.get("name") for p in models_get.get("parameters", [])]
+    check("GET /api/ai/models не принимает api_key в query-строке",
+          "api_key" not in get_params,
+          f"параметры: {get_params} — ключ утечёт в логи и историю браузера")
+    check("POST /api/ai/models существует (ключ передаётся в теле)",
+          "post" in paths.get("/api/ai/models", {}),
+          "нет POST-варианта для передачи ключа в теле запроса")
 
     print("\n-- Утечка секретов через /api/settings --")
     settings.settings.setdefault("ai_providers", [])

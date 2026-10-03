@@ -2787,16 +2787,18 @@ command {"command": "название_команды", "args": {"аргумен�
     def process_command(self, cmd, from_web=False):
         """Выполнить команду из строки.
 
-        from_web=True (так зовёт веб-сервер) — интерактивные пункты запрещены:
-        они ждут input() и заблокировали бы worker-поток FastAPI.
+        from_web=True (так зовёт веб-сервер) — запрещены только ИНТЕРАКТИВНЫЕ
+        пункты: они ждут input()/стрелки и заблокировали бы worker-поток FastAPI.
+        Режимы instant, restart и danger из веба разрешены намеренно — иначе не
+        работали бы /exit и /restart_server, ради которых они и заведены.
         По умолчанию считаем вызов локальным (консоль) и разрешаем всё.
         """
         cmd = (cmd or "").strip()
         if cmd.startswith("/") and cmd[1:] in self.user_commands:
             name = cmd[1:]
-            if from_web and self.COMMAND_MODES.get(name, "instant") != "instant":
-                return ("Команда /%s недоступна из веба — задай её в CONFIG "
-                        "на сайте или в терминале." % name)
+            if from_web and self.COMMAND_MODES.get(name, "instant") == "interactive":
+                return ("Команда /%s недоступна из веба — она ждёт ввода в терминале. "
+                        "Задай её в CONFIG на сайте или в консоли." % name)
             try:
                 self.user_commands[name][0]()
             except SystemExit:

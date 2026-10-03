@@ -518,21 +518,44 @@ def delete_ai_provider(provider_id: str):
 
 
 @app.get("/api/ai/models")
-def get_ai_models(base_url: str = "", api_key: str = ""):
-    """Список моделей с адреса. Не у всех серверов есть /models — тогда впиши имя вручную."""
+def get_ai_models(base_url: str = ""):
+    """Список моделей с адреса, используется СОХРАНЁННЫЙ ключ.
+
+    Ключ намеренно НЕ принимается в query-строке: она попадает в логи сервера,
+    прокси и историю браузера. Чтобы проверить ещё не сохранённый ключ, есть
+    POST-вариант ниже — он принимает ключ в теле запроса.
+    """
     if not ai_instance:
         raise HTTPException(status_code=500, detail="AI не инициализирован")
     # Адрес приходит от клиента и уходит в requests — проверяем против SSRF.
     if base_url.strip():
         base_url = _validate_base_url(base_url)
-    # пустая api_key = «оставь сохранённую», но только если адрес не меняли
-    if not api_key.strip() and not base_url.strip():
-        models, err = ai_instance.list_ai_models()
-    elif not api_key.strip():
-        models, err = ai_instance.list_ai_models(base_url=base_url, api_key=ai_instance.ai_api_key
-                                                if base_url.strip() == ai_instance.ai_base_url else "")
+    if base_url.strip() and base_url.strip() != ai_instance.ai_base_url:
+        # Адрес новый, а ключа в query нет — чужой ключ подставлять нельзя.
+        models, err = ai_instance.list_ai_models(base_url=base_url, api_key="")
     else:
-        models, err = ai_instance.list_ai_models(base_url=base_url, api_key=api_key)
+        models, err = ai_instance.list_ai_models(base_url=base_url or None)
+    return _models_payload(models, err)
+
+
+@app.post("/api/ai/models")
+def post_ai_models(data: AIModelsQuery):
+    """Список моделей с явным ключом в ТЕЛЕ запроса (не в URL — его видно в логах)."""
+    if not ai_instance:
+        raise HTTPException(status_code=500, detail="AI не инициализирован")
+    base_url = data.base_url.strip()
+    if base_url:
+        base_url = _validate_base_url(base_url)
+    api_key = (data.api_key or "").strip()
+    if not api_key and base_url and base_url != ai_instance.ai_base_url:
+        # Новый адрес без ключа — используем сохранённый только для своего адреса.
+        api_key = ""
+    models, err = ai_instance.list_ai_models(base_url=base_url or None,
+                                             api_key=api_key or None)
+    return _models_payload(models, err)
+
+
+def _models_payload(models, err):
     return {"ok": not err, "models": models, "error": err,
             "hint": "" if models else "впиши имя модели вручную"}
 
