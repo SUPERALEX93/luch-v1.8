@@ -144,7 +144,9 @@ def main_test() -> int:
           "work_fuctions.tts_callback не выставлен")
     check("_exit_event создан", hasattr(ai, "_exit_event"))
     check("_state_lock создан", hasattr(ai, "_state_lock"))
-    check("_confirm_lock создан", hasattr(ai, "_confirm_lock"))
+    check("механизма подтверждения нет", not hasattr(ai, "_confirm_lock")
+          and not hasattr(ai, "pending_confirm")
+          and not hasattr(ai, "_handle_pending_confirm"))
 
     print("\n-- должно быть удалено --")
     check("_strip_ansi удалён", not hasattr(ai, "_strip_ansi"))
@@ -226,44 +228,30 @@ def main_test() -> int:
         executed.append((name, kwargs)) or ("ok", "выполнено", None, 0.01))
     ai.speak_text = lambda text: None
 
-    check("«да» распознаётся как подтверждение",
-          bool(ai._confirm_tokens("да") & set(main.AIconsole.CONFIRM_YES_WORDS)))
-    check("«погода в москве» НЕ содержит слова подтверждения",
-          not (ai._confirm_tokens("погода в москве, покажи прогноз")
-               & set(main.AIconsole.CONFIRM_YES_WORDS)),
-          "посторонняя фраза распознана как подтверждение")
-    check("«надо» не путается с «не надо»",
-          not (ai._confirm_tokens("надо сделать") & set(main.AIconsole.CONFIRM_NO_WORDS))
-          and bool(re.search(r"\bне\s+надо\b", "не надо")))
-
-    def _arm() -> None:
-        with ai._confirm_lock:
-            ai.pending_confirm = {"name": "terminal", "kwargs": {"command": "true"},
-                                  "deadline": time.time() + 30}
-
-    _arm()
-    ai._handle_pending_confirm("погода в москве")
-    check("посторонняя фраза НЕ выполняет опасную команду", executed == [],
-          f"выполнено: {executed}")
-    check("посторонняя фраза снимает запрос на подтверждение",
-          ai.pending_confirm is None, "pending_confirm остался висеть")
-
-    _arm()
-    ai._handle_pending_confirm("нет, отмена")
-    check("«отмена» НЕ выполняет команду", executed == [], f"выполнено: {executed}")
-
-    _arm()
-    ai._handle_pending_confirm("подтверждаю")
-    check("«подтверждаю» выполняет команду", len(executed) == 1, f"выполнено: {executed}")
+    # Подтверждения опасных команд больше нет: команда уходит сразу.
+    check("опасная команда выполняется без confirm",
+          ai.web_run_ai_command("terminal", {"command": "true"})["status"] == "ok",
+          "веб всё ещё требует подтверждения")
     check("выполнена именно та команда",
           bool(executed) and executed[0][0] == "terminal", f"{executed}")
+    # Пункт меню берём заведомо безопасный: у пункта в режиме «опасно»
+    # web_run_command сам запускает выход из программы, в тесте это лишнее.
+    safe = next((n for n, m in ai.COMMAND_MODES.items()
+                 if m == "instant" and n in ai.user_commands
+                 and ai.user_commands[n][0] is not None), None)
+    check("веб-пункт меню выполняется без confirm",
+          safe is not None and ai.web_run_command(safe)["status"] == "ok",
+          "меню всё ещё требует подтверждения")
+    check("confirm_dangerous больше не в настройках",
+          "confirm_dangerous" not in main.settings.default_settings)
 
-    _arm()
-    with ai._confirm_lock:
-        ai.pending_confirm["deadline"] = time.time() - 1
-    ai._handle_pending_confirm("подтверждаю")
-    check("просроченное подтверждение не выполняется", len(executed) == 1,
-          f"выполнено: {executed}")
+    # Голосовой путь: команда тоже уходит сразу, без ожидания ответа.
+    executed.clear()
+    rc = ai.parse_ai_command('command {"command": "terminal", "args": {"command": "true"}}')
+    check("из голоса опасная команда выполняется сразу",
+          len(executed) == 1 and executed[0][0] == "terminal", f"выполнено: {executed}")
+    check("голосовая команда не уходит в ожидание подтверждения",
+          rc == 0 and not hasattr(ai, "pending_confirm"), f"вернулось {rc!r}")
 
     print("\n-- валидация аргументов ИИ-команд --")
     # terminal(command, timeout=60) — command обязателен

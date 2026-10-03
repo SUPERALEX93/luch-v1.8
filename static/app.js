@@ -523,7 +523,7 @@
 
         // ══════════════ ПАНЕЛИ CONFIG / MENU ══════════════
         const TOKEN_KEY = 'luch_web_token';
-        let openPanel = null, menuData = null, cfgDirty = false, pendingConfirm = null;
+        let openPanel = null, menuData = null, cfgDirty = false;
 
         // какой пункт меню открывает какое поле в CONFIG
         const CFG_TARGET = {
@@ -533,7 +533,7 @@
             change_speed_ai_voice: 'cfgSpeed', trigger_word: 'cfgTrigger',
             change_stt_mode: 'cfgStt', whisper_model: 'cfgWhisper', micro: 'cfgMicro'
         };
-        const MODE_TAG = { interactive: ['cfg', 'в CONFIG'], danger: ['danger', 'подтвердить'], restart: ['wait', 'перезапуск'] };
+        const MODE_TAG = { interactive: ['cfg', 'в CONFIG'], danger: ['danger', 'опасно'], restart: ['wait', 'перезапуск'] };
 
         const $ = id => document.getElementById(id);
         function saveToken() { try { localStorage.setItem(TOKEN_KEY, $('cfgToken').value); } catch (e) {} tokenWarned = false; }
@@ -1118,7 +1118,6 @@
 
         // ─────────── AI CMD: команды ИИ, их аргументы и вывод ───────────
         let aiCmds = [];        // [{name, icon, desc, example, args:[{name,required,default,type}], danger}]
-        let aiPending = null;   // имя опасной команды, ждущей второго клика
         const aiRows = {};      // name -> {el, inputs:{}, sig}  (сбрасывается на каждой перерисовке)
         const aiLog = [];       // [{time, command, args, status, output, elapsed}]
 
@@ -1227,7 +1226,7 @@
 
             const hint = document.createElement('div');
             hint.className = 'menu-ai-hint';
-            hint.textContent = '* — обязательный аргумент. Команды с тегом «опасно» выполняются после подтверждения.';
+            hint.textContent = '* — обязательный аргумент. Команды с тегом «опасно» выполняются сразу.';
             body.appendChild(hint);
         }
 
@@ -1299,10 +1298,10 @@
             }
             (c.args || []).forEach(a => inputs[a.name] && inputs[a.name].classList.remove('bad'));
 
-            const send = confirm => {
+            const send = () => {
                 busy(btn, true);
                 say('aiLog', `${c.icon || ''} ${c.name} ${JSON.stringify(args)}`, 'dim');
-                return apiPost('/api/ai/commands/run', { command: c.name, args, confirm })
+                return apiPost('/api/ai/commands/run', { command: c.name, args })
                     .then(d => {
                         pushAiLog({
                             time: new Date().toLocaleTimeString('ru-RU'), command: d.command,
@@ -1317,17 +1316,7 @@
                     .finally(() => busy(btn, false));
             };
 
-            if (c.danger && aiPending !== c.name) {
-                aiPending = c.name;
-                const msg = `${c.icon || ''} ${c.name} — нажми ещё раз, чтобы подтвердить`;
-                say('aiLog', msg, 'err');
-                btn.classList.add('warn');
-                setTimeout(() => { if (aiPending === c.name) { aiPending = null; btn.classList.remove('warn'); } }, 5000);
-                return;
-            }
-            aiPending = null;
-            btn.classList.remove('warn');
-            await send(!!c.danger);
+            await send();
         }
 
         async function clearAiLog() {
@@ -1354,18 +1343,9 @@
                 }
                 return;
             }
-            if (it.mode === 'danger' && pendingConfirm !== it.name) {
-                pendingConfirm = it.name;
-                const msg = `нажми ещё раз, чтобы подтвердить /${it.name}`;
-                say('menuLog', msg, 'err');
-                pushCmdLog(it.name, msg, 'warn');
-                setTimeout(() => { if (pendingConfirm === it.name) pendingConfirm = null; }, 4000);
-                return;
-            }
-            pendingConfirm = null;
             say('menuLog', `выполняю /${it.name} …`, 'dim');
             try {
-                const d = await apiPost('/api/menu/run', { name: it.name, confirm: true });
+                const d = await apiPost('/api/menu/run', { name: it.name });
                 say('menuLog', d.output || 'OK', d.status === 'confirm_required' ? 'warn' : 'ok');
                 pushCmdLog(it.name, d.output || 'OK', d.status === 'confirm_required' ? 'warn' : 'ok');
             } catch (e) {

@@ -301,8 +301,6 @@ class AIconsole:
     def __init__(self):
         self._exit_event = threading.Event()
         self._state_lock = threading.RLock()
-        self._confirm_lock = threading.Lock()
-        self.pending_confirm = None
         self.should_exit = False
         self.stop_audio_triggered = False
         self.ignore_response = False
@@ -1474,16 +1472,12 @@ command {"command": "название_команды", "args": {"аргумен�
                 args[a["name"]] = a["default"]
         return args
 
-    def web_run_ai_command(self, name, args=None, confirm=False, timeout=None):
+    def web_run_ai_command(self, name, args=None, confirm=None, timeout=None):
         """Выполнить команду ИИ с сайта. Возвращает {status, output, result, ...}."""
         name = (name or "").strip()
         if name not in (self.commands_ai or {}):
             known = ", ".join(sorted(self.commands_ai or {}))
             raise ValueError("неизвестная команда ИИ «%s». Доступные: %s" % (name, known))
-
-        if self._is_dangerous(name) and not confirm:
-            return {"status": "confirm_required", "command": name, "args": args or {},
-                    "output": "Команда «%s» требует подтверждения на сайте." % name}
 
         kwargs = self._prepare_ai_args(name, args)
         limit = int(timeout or self.AI_COMMAND_TIMEOUT)
@@ -1530,7 +1524,7 @@ command {"command": "название_команды", "args": {"аргумен�
         except Exception as e:
             print(Fore.RED + f"EXIT ERROR: {e}" + Style.RESET_ALL)
 
-    def web_run_command(self, name, confirm=False):
+    def web_run_command(self, name, confirm=None):
         """Выполнить пункт меню из веба. Бросает ValueError с понятным текстом."""
         name = (name or "").strip().lstrip("/")
         if name not in self.user_commands:
@@ -1540,9 +1534,6 @@ command {"command": "название_команды", "args": {"аргумен�
         if mode == "interactive":
             raise ValueError("пункт /%s ждёт ввода в терминале — задай его через панель CONFIG "
                              "на сайте или в консоли" % name)
-        if mode == "danger" and not confirm:
-            return {"status": "confirm_required",
-                    "output": "Команда /%s требует подтверждения." % name}
         if mode == "restart":
             # ответ должен уйти клиенту раньше, чем порт закроется
             threading.Thread(target=self._deferred_restart, daemon=True).start()
@@ -1899,18 +1890,6 @@ command {"command": "название_команды", "args": {"аргумен�
                     known = ", ".join(sorted(self.commands_ai))
                     raise ValueError(f"неизвестная команда '{name}'. Доступные: {known}")
                 kwargs = self._bind_ai_args(name, command["args"])
-                if self._is_dangerous(name) and settings.settings.get("confirm_dangerous", True):
-                    # Опасную команду из голоса выполняем только после подтверждения:
-                    # сохраняем её и просим сказать «подтверждаю» или «отмена».
-                    with self._confirm_lock:
-                        self.pending_confirm = {"name": name, "kwargs": kwargs,
-                                                "deadline": time.time() + 30}
-                    ask = ('Подтверди выполнение команды %s. '
-                           'Скажи "подтверждаю" или "отмена".' % name)
-                    self.response = ask
-                    self._last_cmd = None
-                    self.speak_text(ask)
-                    return 1
                 self.ai_state = "command"
                 try:
                     value, output, error, elapsed = self._invoke_ai_command(
@@ -2661,7 +2640,7 @@ command {"command": "название_команды", "args": {"аргумен�
             self.ai_thread.join()
         i2 = self.parse_ai_command(self.response)
         self._render_ai_response(self.response)
-        if i2 == 1 and self.pending_confirm is None:
+        if i2 == 1:
             self.speak_text(self.response)
         rounds = 0
         while i2 == 0 and rounds < 20:
@@ -2673,7 +2652,7 @@ command {"command": "название_команды", "args": {"аргумен�
             self.ai_thread.join()
             i2 = self.parse_ai_command(self.response)
             self._render_ai_response(self.response)
-            if i2 == 1 and self.pending_confirm is None:
+            if i2 == 1:
                 self.speak_text(self.response)
         if i2 == 0:
             print(Fore.YELLOW + "ИИ слишком долго просит команды — останавливаюсь." + Style.RESET_ALL)
@@ -2682,51 +2661,6 @@ command {"command": "название_команды", "args": {"аргумен�
         self.user_prompt = None
         self.response_ready_event.set()
         self._print_prompt()
-
-    # Слова подтверждения/отмены для опасных команд из голоса
-    CONFIRM_YES_WORDS = ("подтверждаю", "подтвердить", "да", "выполняй", "ок")
-    CONFIRM_NO_WORDS = ("отмена", "нет", "стоп")
-
-    @staticmethod
-    def _confirm_tokens(text):
-        """Слова фразы без пунктуации — чтобы «погода» не совпала с «да»."""
-        return set(re.findall(r"[а-яёa-z0-9]+", (text or "").lower()))
-
-    def _handle_pending_confirm(self, text):
-        """Разобрать ответ на запрос подтверждения. True — фраза обработана здесь."""
-        with self._confirm_lock:
-            pending = self.pending_confirm
-            if pending is None:
-                return False
-            # снимаем запрос сразу: подтверждение/отмена обрабатываются ровно один раз
-            self.pending_confirm = None
-
-        words = self._confirm_tokens(text)
-        lowered = (text or "").lower()
-        expired = time.time() > pending.get("deadline", 0)
-        if expired:
-            reply = "Время подтверждения истекло — команда отменена."
-        elif (words & set(self.CONFIRM_NO_WORDS)) or re.search(r"\bне\s+надо\b", lowered):
-            reply = "Отменяю выполнение команды."
-        elif words & set(self.CONFIRM_YES_WORDS):
-            name = pending.get("name")
-            kwargs = pending.get("kwargs") or {}
-            self.ai_state = "command"
-            try:
-                value, output, error, elapsed = self._invoke_ai_command(
-                    name, kwargs, self.AI_COMMAND_TIMEOUT)
-            finally:
-                self.ai_state = "speaking" if self.ai_speak else "idle"
-            self._record_ai_command(name, kwargs, value, output, error, elapsed, "voice-confirm")
-            if error is not None:
-                reply = "ОШИБКА: %s: %s" % (type(error).__name__, error)
-            else:
-                reply = output or ("" if value is None else str(value)) or "Команда выполнена."
-        else:
-            reply = "Не понял подтверждение — команда отменена."
-        self.response = reply
-        self.speak_text(reply)
-        return True
 
     def listen_user(self, from_file=False):
         recognizer = sr.Recognizer()
@@ -2774,9 +2708,6 @@ command {"command": "название_команды", "args": {"аргумен�
                     text = ""
 
             if voice_ok:
-                # Подтверждение опасной команды разбираем раньше триггер-слова
-                if self._handle_pending_confirm(text):
-                    return
                 if not self.ai_speak:
                     if text and self.user_prompt is None:
                         trigger = (self.trigger_word or "").strip()
