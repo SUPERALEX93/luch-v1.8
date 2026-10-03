@@ -181,14 +181,26 @@ class DevicePoller(private val context: Context) {
                 note("не отвечает $base — $why")
                 continue
             }
+            // Проверяем ответ до записи в настройки: пустые client_id/token
+            // означали бы потерю личности устройства и ответы «чужой токен».
+            val newId = res.optString("client_id")
+            val newToken = res.optString("token")
+            if (newId.isBlank() || newToken.isBlank()) {
+                why = "сервер не вернул client_id/token"
+                note("$base ответил без учётных данных — регистрация не принята")
+                continue
+            }
             // нашли живой адрес — запоминаем и открываем сайт именно на нём,
             // даже если он совпал с введённым: он мог смениться при переподключении
             prefs.serverUrl = base
             onBaseChanged?.invoke(base)
-            prefs.clientId = res.optString("client_id")
-            prefs.token = res.optString("token")
+            prefs.clientId = newId
+            prefs.token = newToken
             prefs.deviceName = res.optString("name", prefs.deviceName)
             prefs.registered = true
+            // Запоминаем версию сборки: иначе при следующем запуске телефон
+            // снова и снова регистрируется с тем же составом возможностей.
+            prefs.registeredVersion = BuildConfig.VERSION_NAME
             note("зарегистрирован как ${prefs.clientId}")
             return true
         }

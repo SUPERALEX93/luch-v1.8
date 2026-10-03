@@ -18,15 +18,23 @@ class LuchBridge(private val ctx: Context) {
     /** Отправка одной фразы; пока ИИ думает, новые фразы ждут в очереди. */
     fun uploadPhrase(b64: String) {
         val u = uploader ?: return
-        voiceSem.acquire()
+        // Флаг занятости ставим до acquire(): пока вызов ждёт очереди, страница
+        // уже должна знать, что микрофонный канал занят.
         uploading = true
+        var acquired = false
         try {
+            voiceSem.acquire()
+            acquired = true
             val err = u.upload(b64)
             if (err.isNotEmpty())
                 CommandRunner(ctx).run("notify", JSONObject()
                     .put("title", "ЛУЧ: микрофон").put("text", err))
+        } catch (e: InterruptedException) {
+            // Мост JavaScript не должен получать InterruptedException наружу.
+            Thread.currentThread().interrupt()
         } finally {
-            uploading = false; voiceSem.release()
+            uploading = false
+            if (acquired) voiceSem.release()
         }
     }
 

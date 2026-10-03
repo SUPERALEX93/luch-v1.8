@@ -7,6 +7,7 @@ import android.util.Base64
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.util.Locale
 import org.json.JSONObject
 
@@ -25,6 +26,10 @@ class VoiceUploader(
 
     private var tts: TextToSpeech? = null
 
+    // Учётные данные телефона. Их надо отправлять в /api/voice: сервер больше
+    // не принимает этот путь по одному лишь веб-токену.
+    private val prefs = Prefs(ctx)
+
     fun speak(text: String) {
         if (text.isBlank()) return
         if (tts == null) tts = TextToSpeech(ctx) { }
@@ -37,7 +42,15 @@ class VoiceUploader(
     }
 
     /** Возвращает "" при успехе или текст ошибки. */
-    fun upload(wavBase64: String): String {
+    fun upload(wavBase64: String): String = try {
+        // Ловим вообще всё: IOException не должен вылетать наружу из моста
+        // JavaScript, иначе WebView падает вместе с приложением.
+        send(wavBase64)
+    } catch (e: Exception) {
+        "не удалось отправить: ${e.message ?: e.javaClass.simpleName}"
+    }
+
+    private fun send(wavBase64: String): String {
         val base = baseProvider().trimEnd('/')
         if (base.isEmpty()) return "не задан адрес сервера"
         val bytes = try {
@@ -57,9 +70,14 @@ class VoiceUploader(
             return "не удалось собрать запрос"
         }
 
+        // Сервер пускает на /api/voice только по учётным данным устройства,
+        // переданным параметрами адреса: client_id + token.
+        val query = "client_id=" + URLEncoder.encode(prefs.clientId, "UTF-8") +
+            "&token=" + URLEncoder.encode(prefs.token, "UTF-8")
+
         var conn: HttpURLConnection? = null
         return try {
-            conn = URL("$base/api/voice").openConnection() as HttpURLConnection
+            conn = URL("$base/api/voice?$query").openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.doOutput = true
             conn.connectTimeout = 10000

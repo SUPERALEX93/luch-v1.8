@@ -27,24 +27,32 @@ class AudioRecorder(private val ctx: Context) {
     /** Возвращает пустую строку при успехе или текст ошибки. */
     fun start(): String {
         if (rec != null) return "запись уже идёт"
+        var m: MediaRecorder? = null
+        var f: File? = null
         return try {
-            val f = File(ctx.cacheDir, "luch_voice_" + System.currentTimeMillis() + ".m4a")
-            val m = newRecorder()
-            m.setAudioSource(MediaRecorder.AudioSource.MIC)
-            m.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            m.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            val file = File(ctx.cacheDir, "luch_voice_" + System.currentTimeMillis() + ".m4a")
+            f = file
+            val recorder = newRecorder()
+            m = recorder
+            recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
             // Параметры, которые лучше всего понимает распознавание речи
-            m.setAudioEncodingBitRate(64000)
-            m.setAudioSamplingRate(16000)
-            m.setOutputFile(f.absolutePath)
-            m.prepare()
-            m.start()
-            rec = m
-            outFile = f
+            recorder.setAudioEncodingBitRate(64000)
+            recorder.setAudioSamplingRate(16000)
+            recorder.setOutputFile(file.absolutePath)
+            recorder.prepare()
+            recorder.start()
+            rec = recorder
+            outFile = file
             ""
         } catch (e: Exception) {
-            rec?.release()
+            // Освобождаем настоящий рекордер (не rec — он ещё null) и убираем файл.
+            runCatching { m?.reset() }
+            runCatching { m?.release() }
+            f?.delete()
             rec = null
+            outFile = null
             "не удалось начать запись: ${e.message ?: e.javaClass.simpleName}. " +
                 "Проверьте, выдано ли приложению разрешение на микрофон."
         }
@@ -74,7 +82,15 @@ class AudioRecorder(private val ctx: Context) {
         if (f == null || !f.exists() || f.length() == 0L) {
             return JSONObject().put("ok", false).put("error", "файл записи пустой").toString()
         }
-        val b64 = Base64.encodeToString(f.readBytes(), Base64.NO_WRAP)
+        // Чтение файла тоже может упасть (нет места, файл пропал) — из метода
+        // моста JavaScript исключение вылетать не должно.
+        val b64 = try {
+            Base64.encodeToString(f.readBytes(), Base64.NO_WRAP)
+        } catch (e: Exception) {
+            f.delete()
+            return JSONObject().put("ok", false)
+                .put("error", "не удалось прочитать запись: ${e.message ?: e.javaClass.simpleName}").toString()
+        }
         f.delete()
         return JSONObject().put("ok", true).put("b64", b64).put("mime", "audio/mp4").toString()
     }

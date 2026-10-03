@@ -15,6 +15,7 @@ import android.os.IBinder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
@@ -44,11 +45,15 @@ class LocationService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_ONCE) sendLastKnown()
-        return START_STICKY
+        // Не просим систему перезапускать службу вслепую: в фоне тип
+        // foregroundServiceType=location может быть запрещён и уронить процесс.
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
         runCatching { manager?.removeUpdates(listener) }
+        // Без отмены корутины scope держал бы службу и её запросы после смерти.
+        scope.cancel()
         super.onDestroy()
     }
 
@@ -63,9 +68,16 @@ class LocationService : Service() {
             .setContentIntent(open)
             .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-            startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
-        else startForeground(1, notif)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+                startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+            else startForeground(1, notif)
+        } catch (e: Exception) {
+            // На Android 12+ запуск location-службы из фона может быть запрещён.
+            // Это не повод падать: тихо останавливаемся.
+            android.util.Log.w("LuchLocation", "не удалось выйти в foreground", e)
+            stopSelf()
+        }
     }
 
     private fun startUpdates() {

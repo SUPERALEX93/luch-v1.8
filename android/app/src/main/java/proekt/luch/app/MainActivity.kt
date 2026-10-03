@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
 import android.os.PowerManager
@@ -15,7 +16,7 @@ import android.webkit.PermissionRequest
 import android.webkit.SslErrorHandler
 import android.net.http.SslError
 import android.webkit.WebChromeClient
-import android.webkit.WebSettings
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
@@ -33,6 +34,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: Prefs
     private lateinit var poller: DevicePoller
     private lateinit var uploader: VoiceUploader
+    private var voice: VoiceListener? = null
+    private var setupDialog: AlertDialog? = null
     private var pendingAudioPermission: PermissionRequest? = null
     private var pendingAudioGrant: Array<String>? = null
     private var statusView: View? = null
@@ -91,9 +94,32 @@ class MainActivity : AppCompatActivity() {
 
         val bridge = LuchBridge(this)
         // Микрофон открыт постоянно, фразы уходят на сервер сами из телефона
-        bridge.attachVoice(VoiceListener { b64 -> bridge.uploadPhrase(b64) }, uploader)
+        val listener = VoiceListener { b64 -> bridge.uploadPhrase(b64) }
+        voice = listener
+        bridge.attachVoice(listener, uploader)
         web.addJavascriptInterface(bridge, "LuchAndroid")
         web.webViewClient = object : WebViewClient() {
+            // Мост LuchAndroid выдаёт микрофон, буфер обмена и уведомления.
+            // Поэтому в WebView пускаем только адрес настроенного сервера
+            // (или localhost): любую другую навигацию блокируем и открываем
+            // во внешнем браузере, где моста нет.
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                val url = request.url?.toString().orEmpty()
+                if (isAllowedUrl(url)) return false
+                openExternal(url)
+                return true
+            }
+
+            // Защита в глубину: если навигация всё же началась на чужой хост,
+            // останавливаем её и возвращаемся на свой сервер.
+            override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                if (!isAllowedUrl(url)) {
+                    view.stopLoading()
+                    val base = prefs.base()
+                    if (base.isNotEmpty()) view.loadUrl("$base/")
+                }
+            }
+
             override fun onPageFinished(view: WebView, url: String) {
                 view.visibility = View.VISIBLE
                 injectCss(view)
@@ -104,19 +130,23 @@ class MainActivity : AppCompatActivity() {
             // Сервер в домашней сети работает с самоподписанным сертификатом.
             // HTTPS обязателен: микрофон в WebView доступен только в защищённом
             // контексте, а на http://IP адресе navigator.mediaDevices не существует.
+            // Но ошибку TLS прощаем только своему серверу, не любому хосту.
             override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
-                handler.proceed()
+                if (isAllowedUrl(error.url)) handler.proceed() else handler.cancel()
             }
         }
         web.webChromeClient = object : WebChromeClient() {
             override fun onGeolocationPermissionsShowPrompt(origin: String, cb: GeolocationPermissions.Callback?) {
-                cb?.invoke(origin, true, false)
+                // Геолокация — только своей странице.
+                cb?.invoke(origin, isAllowedUrl(origin), false)
             }
 
             // Без этого WebView молча запрещает доступ к микрофону со страницы,
             // даже когда разрешение RECORD_AUDIO уже выдано системой.
             override fun onPermissionRequest(request: PermissionRequest) {
                 val req = request
+                // Микрофон чужому источнику не отдаём.
+                if (!isAllowedUrl(req.origin?.toString().orEmpty())) { req.deny(); return }
                 val wanted = req.resources.filter { it == PermissionRequest.RESOURCE_AUDIO_CAPTURE }
                 if (wanted.isEmpty()) { req.deny(); return }
                 if (hasPerm(Manifest.permission.RECORD_AUDIO)) {
@@ -137,10 +167,10 @@ class MainActivity : AppCompatActivity() {
             loadWithOverviewMode = true
             builtInZoomControls = true
             displayZoomControls = false
-            allowFileAccess = false
             allowContentAccess = false
             mediaPlaybackRequiresUserGesture = false
-            cacheMode = WebSettings.LOAD_DEFAULT
+            // Кэш отключён выше (LOAD_NO_CACHE) намеренно: старая страница из
+            // кэша — главная причина «ничего не изменилось». Не переопределяем.
         }
         web.setBackgroundColor(0xFF0B0F14.toInt())
         val root = android.widget.FrameLayout(this)
@@ -199,7 +229,59 @@ class MainActivity : AppCompatActivity() {
         web.loadUrl(prefs.base() + "/")
     }
 
+    /** Открыть ссылку во внешнем браузере: там нет моста LuchAndroid. */
+    private fun openExternal(url: String) {
+        if (url.isBlank()) return
+        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return
+        runCatching {
+            startActivity(Intent(Intent.ACTION_VIEW, uri)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        }
+    }
+
+    /** Хост настроенного сервера (в нижнем регистре) или "". */
+    private fun configuredHost(): String {
+        val base = prefs.base()
+        if (base.isEmpty()) return ""
+        return runCatching { Uri.parse(base).host?.lowercase() }.getOrNull().orEmpty()
+    }
+
+    /** Порты настроенного сервера: он отдаёт http и https на соседних портах
+     *  (см. DevicePoller.candidateBases), поэтому допускаем port-1..port+1. */
+    private fun configuredPorts(): Set<Int> {
+        val base = prefs.base()
+        if (base.isEmpty()) return emptySet()
+        val u = runCatching { Uri.parse(base) }.getOrNull() ?: return emptySet()
+        if (u.port == -1) {
+            // Порт не указан — сервер отдаёт и http (80), и https (443).
+            return setOf(80, 443)
+        }
+        val p = u.port
+        return setOf(p - 1, p, p + 1).filter { it in 1..65535 }.toSet()
+    }
+
+    /** Разрешён ли адрес: только http/https, хост настроенного сервера на его
+     *  портах либо localhost/127.0.0.1. Всё остальное — чужой источник. */
+    private fun isAllowedUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val u = runCatching { Uri.parse(url) }.getOrNull() ?: return false
+        val scheme = u.scheme?.lowercase() ?: return false
+        if (scheme != "http" && scheme != "https") return false
+        val host = u.host?.lowercase() ?: return false
+        if (host == "localhost" || host == "127.0.0.1") return true
+        val cfg = configuredHost()
+        if (cfg.isEmpty() || host != cfg) return false
+        val port = when {
+            u.port != -1 -> u.port
+            scheme == "https" -> 443
+            else -> 80
+        }
+        return port in configuredPorts()
+    }
+
     private fun showSetup() {
+        // Повторный вход (кнопка ⚙ или баннер статуса) не должен плодить диалоги.
+        setupDialog?.dismiss()
         val pad = (18 * resources.displayMetrics.density).toInt()
         val box = LinearLayout(this)
         box.orientation = LinearLayout.VERTICAL
@@ -228,7 +310,7 @@ class MainActivity : AppCompatActivity() {
         ver.setPadding(0, 0, 0, pad / 2)
         box.addView(ver)
 
-        AlertDialog.Builder(this)
+        setupDialog = AlertDialog.Builder(this)
             .setTitle("Подключение к ЛУЧ")
             .setView(box)
             .setCancelable(false)
@@ -373,9 +455,18 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         statusWatcher?.let { android.os.Handler(mainLooper).removeCallbacks(it) }
+        // Останавливаем слушатель (его поток записи и поток отправки) и
+        // освобождаем TTS: иначе каждая активность течёт микрофоном и движком.
+        runCatching { voice?.stop() }
+        voice = null
+        runCatching { uploader.release() }
+        setupDialog?.dismiss()
+        setupDialog = null
         poller.stop()
         LocationService.stop(this)
         web.destroy()
+        // Статическая ссылка не должна держать уничтоженную активность.
+        instance = java.lang.ref.WeakReference(null)
         super.onDestroy()
     }
 

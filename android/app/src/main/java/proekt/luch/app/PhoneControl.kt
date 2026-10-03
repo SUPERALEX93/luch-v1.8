@@ -38,11 +38,19 @@ class PhoneControl(private val ctx: Context) {
             BatteryManager.BATTERY_STATUS_FULL -> "заряд полный"
             else -> "на батарее"
         }
+        // Данных о заряде может не быть вовсе: отрицательные и нулевые значения
+        // нельзя выдавать за проценты.
+        val percent = when {
+            bat in 1..100 -> bat
+            level in 1..100 -> level
+            else -> -1
+        }
+        val batText = if (percent > 0) "батарея $percent% ($charge)" else "заряд батареи неизвестен"
         val am = ctx.getSystemService(AudioManager::class.java)
         val vol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
         val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         return "ok" to ("модель ${Build.MODEL}, Android ${Build.VERSION.RELEASE}, " +
-            "батарея ${if (bat > 0) "$bat" else "$level"}% ($charge), " +
+            "$batText, " +
             "громкость $vol из $max, ${if (torchOn != null) "фонарик включён" else "фонарик выключен"}")
     }
 

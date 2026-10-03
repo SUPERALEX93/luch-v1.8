@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import androidx.core.app.NotificationManagerCompat
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -28,7 +29,7 @@ class CommandRunner(private val context: Context) {
             "vibrate" -> vibrate(args.optInt("ms", 500))
             "ring" -> ring()
             "open_url" -> openUrl(args.optString("url", ""))
-            "battery" -> "ok" to "батарея ${Prefs.battery(context)}%"
+            "battery" -> "ok" to "заряд батареи: ${Prefs.batteryText(context)}"
             "location" -> "ok" to "координаты отправлены"
             // управление телефоном по командам ИИ
             "status" -> phone.status()
@@ -54,6 +55,11 @@ class CommandRunner(private val context: Context) {
     }
 
     private fun notify(title: String, text: String): Pair<String, String> {
+        // Начиная с Android 13 уведомления можно запретить. Без этой проверки
+        // команда рапортовала «ok», хотя пользователь ничего не видел.
+        if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) {
+            return "error" to "уведомления запрещены — разрешите их ЛУЧ в настройках Android"
+        }
         val body = if (text.isNotEmpty()) text else "Пустое уведомление"
         val id = notifSeq.incrementAndGet()
         val intent = Intent(context, MainActivity::class.java)
@@ -99,8 +105,8 @@ class CommandRunner(private val context: Context) {
             ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
             ?: return "error" to "в системе нет рингтона"
         val am = context.getSystemService(AudioManager::class.java)
-        runCatching { am.setStreamVolume(AudioManager.STREAM_ALARM, 100, 0) }
-        runCatching { am.setStreamVolume(AudioManager.STREAM_RING, 100, 0) }
+        runCatching { am.setStreamVolume(AudioManager.STREAM_ALARM, am.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0) }
+        runCatching { am.setStreamVolume(AudioManager.STREAM_RING, am.getStreamMaxVolume(AudioManager.STREAM_RING), 0) }
         val ringtone = RingtoneManager.getRingtone(context, uri)
         ringing = ringtone
         runCatching { ringtone.play() }

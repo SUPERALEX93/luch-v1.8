@@ -5,6 +5,7 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Base64
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.max
 import kotlin.math.min
@@ -28,9 +29,9 @@ class VoiceListener(private val onPhrase: (String) -> Unit) {
     // буфер AudioRecord переполняется и всё сказанное за это время теряется.
     // Поэтому фразы складываются в короткую очередь и уходят отдельным потоком.
     private val pending = ArrayDeque<String>()
-    private val sender = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "luch-voice-send").apply { isDaemon = true }
-    }
+    // Поток отправки создаётся при старте и освобождается при stop(), иначе
+    // каждая перезапись слушателя копила бы поток.
+    @Volatile private var sender: ExecutorService? = null
     @Volatile private var sending = false
 
     companion object {
@@ -51,6 +52,11 @@ class VoiceListener(private val onPhrase: (String) -> Unit) {
 
     fun start() {
         if (running) return
+        if (sender?.isShutdown != false) {
+            sender = Executors.newSingleThreadExecutor { r ->
+                Thread(r, "luch-voice-send").apply { isDaemon = true }
+            }
+        }
         running = true
         thread = Thread({ loop() }, "luch-voice").apply { start() }
     }
@@ -60,6 +66,9 @@ class VoiceListener(private val onPhrase: (String) -> Unit) {
         running = false
         thread?.join(1200)
         thread = null
+        // Освобождаем поток отправки: при следующем старте он будет создан заново.
+        sender?.shutdown()
+        sender = null
     }
 
     private fun loop() {
@@ -174,33 +183,44 @@ class VoiceListener(private val onPhrase: (String) -> Unit) {
     }
 
     private fun send(pcm: ByteArrayOutputStream) {
-        val raw = pcm.toByteArray()
-        if (raw.size < SAMPLE_RATE) return     // меньше половины секунды — мусор
-        val wav = wav(raw, SAMPLE_RATE)
-        val b64 = Base64.encodeToString(wav, Base64.NO_WRAP)
-        pcm.reset()
-        synchronized(pending) {
-            // Ответ ИИ может идти дольше, чем человек говорит. Держим только
-            // последние фразы: отвечать на то, что было пять минут назад,
-            // хуже, чем промолчать.
-            while (pending.size >= MAX_PENDING) pending.removeFirst()
-            pending.add(b64)
+        try {
+            val raw = pcm.toByteArray()
+            if (raw.size < SAMPLE_RATE) return     // меньше половины секунды — мусор
+            val wav = wav(raw, SAMPLE_RATE)
+            val b64 = Base64.encodeToString(wav, Base64.NO_WRAP)
+            synchronized(pending) {
+                // Ответ ИИ может идти дольше, чем человек говорит. Держим только
+                // последние фразы: отвечать на то, что было пять минут назад,
+                // хуже, чем промолчать.
+                while (pending.size >= MAX_PENDING) pending.removeFirst()
+                pending.add(b64)
+            }
+            pump()
+        } finally {
+            // Сбрасываем всегда, в том числе для короткой фразы: иначе она
+            // приклеится к следующей и буфер будет только расти.
+            pcm.reset()
         }
-        pump()
     }
 
     private fun pump() {
         if (sending) return
+        val ex = sender ?: return
         sending = true
-        sender.execute {
-            while (true) {
-                val b64 = synchronized(pending) { pending.removeFirstOrNull() } ?: break
-                try {
-                    onPhrase(b64)
-                } catch (e: Exception) {
-                    android.util.Log.w("LuchVoice", "не отправил фразу", e)
+        try {
+            ex.execute {
+                while (true) {
+                    val b64 = synchronized(pending) { pending.removeFirstOrNull() } ?: break
+                    try {
+                        onPhrase(b64)
+                    } catch (e: Exception) {
+                        android.util.Log.w("LuchVoice", "не отправил фразу", e)
+                    }
                 }
+                sending = false
             }
+        } catch (e: Exception) {
+            // исполнитель уже остановлен (stop() во время отправки)
             sending = false
         }
     }

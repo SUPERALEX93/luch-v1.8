@@ -17,8 +17,8 @@ object Net {
     @Volatile var lastError: String = ""
         private set
 
-    private fun describe(e: Exception): String = when (e) {
-        is SocketTimeoutException -> "сервер не отвечает дольше 6 секунд"
+    private fun describe(e: Exception, timeout: Int): String = when (e) {
+        is SocketTimeoutException -> "сервер не отвечает дольше ${timeout / 1000} секунд"
         is ConnectException ->
             "соединение отклонено: неверный адрес или порт, либо сервер не запущен"
         is SSLException -> "ошибка HTTPS: ${e.message ?: "сертификат не подходит"}"
@@ -69,12 +69,12 @@ object Net {
     suspend fun get(base: String, path: String, params: Map<String, String> = emptyMap(),
                     timeout: Int = 6000): Pair<JSONObject, Int> = withContext(Dispatchers.IO) {
         try { open(base + path + query(params), "GET", null, timeout).also { lastError = "" } }
-        catch (e: Exception) { lastError = describe(e); JSONObject() to 0 }
+        catch (e: Exception) { lastError = describe(e, timeout); JSONObject() to 0 }
     }
 
     suspend fun post(base: String, path: String, body: JSONObject, params: Map<String, String> = emptyMap(),
                      timeout: Int = 6000): Pair<JSONObject, Int> = withContext(Dispatchers.IO) {
         try { open(base + path + query(params), "POST", body.toString(), timeout).also { lastError = "" } }
-        catch (e: Exception) { lastError = describe(e); JSONObject() to 0 }
+        catch (e: Exception) { lastError = describe(e, timeout); JSONObject() to 0 }
     }
 }

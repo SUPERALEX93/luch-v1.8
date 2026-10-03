@@ -74,5 +74,11 @@ class Prefs(context: Context) {
             val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
             return if (level >= 0 && scale > 0) level * 100 / scale else -1
         }
+
+        /** Готовый текст о заряде: при отсутствии данных не «-1%», а «неизвестно». */
+        fun batteryText(context: Context): String {
+            val b = battery(context)
+            return if (b in 1..100) "$b%" else "неизвестно"
+        }
     }
 }
