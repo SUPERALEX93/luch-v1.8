@@ -13,6 +13,7 @@
 import io
 import os
 import select as _select
+import shutil
 import sys
 import time
 from contextlib import contextmanager
@@ -67,6 +68,18 @@ class _Buffer:
         self.limit = limit
         self.encoding = "utf-8"
         self.errors = "strict"
+        # совместимость с интерфейсом текстового потока: код может читать
+        # name/buffer/closed, даже если сейчас никто в репозитории так не делает
+        self.name = "<menu>"
+        self.buffer = io.BytesIO()
+        self._closed = False
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def close(self):
+        self._closed = True
 
     def _push(self, line):
         if len(self._lines) >= self.limit:
@@ -105,9 +118,12 @@ class _Buffer:
             if self._pending:
                 self._push(self._pending)
                 self._pending = ""
+            # считаем dropped ДО сброса, иначе уведомление «скрыто ещё N строк»
+            # никогда не показывается (прежний баг)
+            dropped = self._dropped
             lines, self._lines, self._dropped = self._lines, [], 0
-        if self._dropped:
-            lines.append(f"… скрыто ещё {self._dropped} строк фонового вывода")
+        if dropped:
+            lines.append(f"… скрыто ещё {dropped} строк фонового вывода")
         return lines
 
 
@@ -140,15 +156,23 @@ class _Frame:
         self.is_terminal = console.is_terminal
         self.drawn = False
         self.lines = height
+        # переиспользуемые буфер и Console: новый объект на каждый кадр не нужен
+        self._buf = io.StringIO()
+        self._tmp = None
+        self._tmp_size = None
 
     def _render(self, panel):
-        buf = io.StringIO()
-        tmp = Console(file=buf, width=self.width, height=self.height,
-                      force_terminal=self.is_terminal,
-                      color_system=self.color_system, no_color=self.no_color,
-                      highlight=False, soft_wrap=False, markup=False, emoji=True)
-        tmp.print(panel)
-        lines = buf.getvalue().split("\n")
+        if self._tmp is None or self._tmp_size != (self.width, self.height):
+            self._buf = io.StringIO()
+            self._tmp = Console(file=self._buf, width=self.width, height=self.height,
+                                force_terminal=self.is_terminal,
+                                color_system=self.color_system, no_color=self.no_color,
+                                highlight=False, soft_wrap=False, markup=False, emoji=True)
+            self._tmp_size = (self.width, self.height)
+        self._buf.seek(0)
+        self._buf.truncate(0)
+        self._tmp.print(panel)
+        lines = self._buf.getvalue().split("\n")
         while lines and not lines[-1].strip():
             lines.pop()
         return lines
@@ -216,7 +240,11 @@ def items_from(options, current=None, allow_custom=False, custom_label="✎  В�
 
 
 def _trunc(text, width):
-    """Обрезает строку ровно до width ячеек терминала (по cell_len)."""
+    """Единственная реализация обрезки по ширине (в ячейках терминала).
+
+    Обрезает строку ровно до width ячеек (по cell_len), при нехватке места
+    добавляет «…». _fit/_pad_text ниже переиспользуют эту логику.
+    """
     text = str(text)
     if width <= 0:
         return ""
@@ -233,10 +261,14 @@ def _trunc(text, width):
     return "".join(out) + "…"
 
 
+def _pad_str(text, width):
+    """Дополняет уже обрезанную строку пробелами ровно до width ячеек."""
+    return text + " " * max(0, width - cell_len(text))
+
+
 def _fit(text, width):
     """Обрезает до width ячеек и дополняет пробелами ровно до width."""
-    t = _trunc(text, width)
-    return t + " " * max(0, width - cell_len(t))
+    return _pad_str(_trunc(text, width), width)
 
 
 def _pad_text(text, width):
@@ -245,19 +277,40 @@ def _pad_text(text, width):
     return text
 
 
-def _geometry(console, entries, height):
+def _section_rows(entries):
+    """Строки, которые занимают заголовки групп вместе с пустыми разделителями."""
+    seen = False
+    n = 0
+    for e in entries:
+        if isinstance(e, Section):
+            if seen:
+                n += 1        # пустая строка-разделитель перед заголовком
+            n += 1            # сам заголовок
+            seen = True
+        else:
+            seen = True
+    return n
+
+
+def _geometry(console, entries, height, term_size=None):
     """Фиксирует размеры рамки на всё время работы меню.
 
-    Возвращает (panel_w, inner, rows_target, item_rows). Значения не должны
-    меняться между кадрами, иначе rich Live начнёт «уезжать».
+    Возвращает (panel_w, inner, rows_target, item_rows). panel_w/inner/rows_target
+    не должны меняться между кадрами, иначе rich Live начнёт «уезжать».
+    item_rows здесь — стартовая оценка; в цикле она пересчитывается под
+    фактическое число динамических строк (поиск, ввод номера, заголовки групп,
+    счётчик скролла, подсказка).
     """
-    n_sections = sum(1 for e in entries if isinstance(e, Section))
-    term_w = console.width or 80
-    term_h = console.height or 24
+    if term_size:
+        term_w, term_h = term_size
+    else:
+        term_w, term_h = console.width or 80, console.height or 24
+    n_sections = _section_rows(entries)
     panel_w = max(MIN_PANEL_W, min(term_w, MAX_PANEL_W))
     inner = panel_w - 4
     screen_rows = max(8, term_h - 6)
-    extra = n_sections + 4          # заголовки групп + счётчик + подсказка(2 строки)
+    # резерв: строка счётчика скролла (1) + две строки подсказки
+    extra = n_sections + 3
     n_items = sum(1 for e in entries if not isinstance(e, Section))
     item_rows = max(3, min(height, n_items, screen_rows - extra))
     rows_target = min(item_rows + extra, screen_rows)
@@ -265,54 +318,105 @@ def _geometry(console, entries, height):
     return panel_w, inner, rows_target, item_rows
 
 
-def _read_char(fd, timeout=0.0):
-    """Прочитать один полноценный символ UTF-8 (а не один байт)."""
-    try:
-        first = os.read(fd, 1)
-    except OSError:
-        return ""
-    if not first:
-        return ""
-    b0 = first[0]
+def _overhead_rows(view_items, query, digits, hint, reserve_scroll=True):
+    """Сколько строк кадра уйдёт не на пункты (для расчёта item_rows)."""
+    n = _section_rows(view_items)
+    if query:
+        n += 1
+    if digits:
+        n += 1
+    if reserve_scroll:
+        n += 1            # строка счётчика «пункт N из M» резервируется всегда
+    if hint:
+        n += 2            # пустая строка + текст подсказки
+    return n
+
+
+def _utf8_len(b0):
+    """Ожидаемая длина UTF-8-последовательности по первому байту."""
     if b0 < 0x80:
-        return chr(b0)
-    need = 0
+        return 1
     if 0xC0 <= b0 <= 0xDF:
-        need = 1
-    elif 0xE0 <= b0 <= 0xEF:
-        need = 2
-    elif 0xF0 <= b0 <= 0xF7:
-        need = 3
-    raw = first
-    for _ in range(need):
-        if timeout:
-            ready, _, _ = _select.select([fd], [], [], timeout)
-            if not ready:
-                break
-        try:
-            nxt = os.read(fd, 1)
-        except OSError:
-            break
-        if not nxt:
-            break
-        raw += nxt
-    return raw.decode("utf-8", "ignore")
+        return 2
+    if 0xE0 <= b0 <= 0xEF:
+        return 3
+    if 0xF0 <= b0 <= 0xF7:
+        return 4
+    return 1              # одиночный/битый байт — декодируем как есть
 
 
-def _read_key(fd):
+def _decode_one(buf):
+    """Извлекает один полный UTF-8 символ из bytearray buf.
+
+    Возвращает (символ, сколько байт съедено) или (None, 0), если данных
+    ещё мало — тогда неполные байты остаются в buf до следующего чтения.
+    """
+    if not buf:
+        return None, 0
+    need = _utf8_len(buf[0])
+    if len(buf) < need:
+        return None, 0
+    raw = bytes(buf[:need])
+    del buf[:need]
+    return raw.decode("utf-8", "replace"), need
+
+
+def _fill_buf(fd, buf, timeout):
+    """Добирает байты из fd в buf. Возвращает 'data' / 'timeout' / 'eof'."""
+    try:
+        ready, _, _ = _select.select([fd], [], [], timeout)
+    except OSError:
+        return "eof"
+    if not ready:
+        return "timeout"
+    try:
+        data = os.read(fd, 256)
+    except OSError:
+        return "eof"
+    if not data:
+        return "eof"
+    buf.extend(data)
+    return "data"
+
+
+def _read_char(fd, buf, timeout=0.0):
+    """Читает один полноценный символ UTF-8, не блокируясь на неполной последовательности.
+
+    Возвращает символ, "" (данных пока нет) или None (stdin закрыт).
+    """
+    while True:
+        ch, _ = _decode_one(buf)
+        if ch is not None:
+            return ch
+        wait = timeout if not buf else 0.1   # хвост последовательности уже в пути
+        state = _fill_buf(fd, buf, wait)
+        if state == "eof":
+            if buf:
+                raw = bytes(buf)
+                del buf[:]
+                return raw.decode("utf-8", "replace")
+            return None
+        if state == "timeout":
+            if buf and len(buf) >= 4:        # заведомо битая последовательность
+                raw = bytes(buf)
+                del buf[:]
+                return raw.decode("utf-8", "replace")
+            return ""
+
+
+def _read_key(fd, buf):
     """Читает одну клавишу, возвращает (имя, символ)."""
-    ch = _read_char(fd)
-    if not ch:
+    ch = _read_char(fd, buf)
+    if ch is None:
         return "exit", ""
+    if ch == "":
+        return "none", ""
 
     if ch == "\x1b":
         seq = ""
         while True:
-            ready, _, _ = _select.select([fd], [], [], 0.12)
-            if not ready:
-                break
-            nxt = _read_char(fd)
-            if not nxt:
+            nxt = _read_char(fd, buf, timeout=0.12)
+            if nxt is None or nxt == "":
                 break
             seq += nxt
             if nxt.isalpha() or nxt == "~":
@@ -449,8 +553,15 @@ def _build_rows(view_items, cursor, first_shown, query, digits, total, shown_cou
     return rows
 
 
-def _frame(title, subtitle, rows, panel_w, rows_target, inner):
-    """Собирает панель строго фиксированного размера: rows_target строк × panel_w."""
+def _frame(title, subtitle, rows, panel_w, rows_target, inner, keep_tail=0):
+    """Собирает панель строго фиксированного размера: rows_target строк × panel_w.
+
+    keep_tail — сколько последних строк нельзя терять при переполнении
+    (счётчик скролла + подсказка), чтобы они не исчезали в тесном терминале.
+    """
+    if len(rows) > rows_target:
+        keep = rows[-keep_tail:] if keep_tail else []
+        rows = rows[:max(0, rows_target - len(keep))] + keep
     body = Text()
     for i in range(rows_target):
         if i:
@@ -522,7 +633,10 @@ def select(title, entries, subtitle="", hint="", height=16, console=None):
     except Exception:
         return _fallback_select(console, title, entries, subtitle)
 
-    panel_w, inner, rows_target, item_rows = _geometry(console, entries, height)
+    # геометрию считаем от реального размера терминала, а не от размера Console
+    _term0 = shutil.get_terminal_size()
+    panel_w, inner, rows_target, item_rows = _geometry(console, entries, height,
+                                                       (_term0.columns, _term0.lines))
     state = {"query": "", "digits": "", "digits_at": 0.0, "cursor": 0}
 
     def active_items():
@@ -576,13 +690,33 @@ def select(title, entries, subtitle="", hint="", height=16, console=None):
         try:
             sys.__stdout__.write("\x1b[?25l")
             sys.__stdout__.flush()
+            kbuf = bytearray()                 # недобранные байты UTF-8 между чтениями
+            term_size = shutil.get_terminal_size()
             while True:
+                # при изменении размера терминала пересчитываем геометрию
+                new_size = shutil.get_terminal_size()
+                if (new_size.columns, new_size.lines) != (term_size.columns, term_size.lines):
+                    term_size = new_size
+                    try:
+                        screen.clear()
+                    except Exception:
+                        pass
+                    panel_w, inner, rows_target, item_rows = _geometry(console, entries, height,
+                                                                       (term_size.columns, term_size.lines))
+                    screen.width = panel_w
+                    screen.height = rows_target + 2
+
                 if state["digits"] and time.time() - state["digits_at"] > 0.8:
                     state["digits"] = ""
                 view, sel = rebuild_view()
                 total = len(sel)
                 if state["cursor"] >= total:
                     state["cursor"] = max(0, total - 1)
+                # динамический расчёт строк под пункты: вычитаем фактические
+                # строки поиска/номера/заголовков/счётчика/подсказки, иначе
+                # _frame обрезал бы хвост вместе со счётчиком и подсказкой
+                overhead = _overhead_rows(view, state["query"], state["digits"], hint)
+                item_rows = max(1, rows_target - overhead)
                 idxs, start = _visible(total, state["cursor"], item_rows)
                 shown = []
                 n = -1
@@ -595,9 +729,21 @@ def select(title, entries, subtitle="", hint="", height=16, console=None):
                             shown.append(e)
                 rows = _build_rows(shown, state["cursor"], start, state["query"], state["digits"],
                                    total, len(idxs), inner, hint)
-                screen.draw(_frame(title, subtitle, rows, panel_w, rows_target, inner))
+                # счётчик скролла + подсказка не должны пропадать в тесном терминале
+                screen.draw(_frame(title, subtitle, rows, panel_w, rows_target, inner,
+                                   keep_tail=3 if hint else 1))
 
-                key, sym = _read_key(fd)
+                # ждём ввод с таймаутом — кадр обновляется и без нажатия клавиши
+                # (истечение буфера цифр) и перерисовывается после ресайза
+                try:
+                    ready, _, _ = _select.select([fd], [], [], 0.2)
+                except OSError:
+                    ready = True
+                if not ready:
+                    continue
+                key, sym = _read_key(fd, kbuf)
+                if key == "none":
+                    continue
 
                 if key in ("enter", "tab"):
                     actives = active_items()
@@ -628,7 +774,10 @@ def select(title, entries, subtitle="", hint="", height=16, console=None):
                         state["digits"] += sym
                         state["digits_at"] = time.time()
                         jump(int(state["digits"]))
-                    elif sym in ("q", "Q", "й", "Й") and not state["query"]:
+                    elif sym in ("q", "Q", "й", "Й") and state["query"]:
+                        # q/й отменяют меню ТОЛЬКО когда поиск уже начат (запрос
+                        # непустой); при пустом запросе они печатаются как есть,
+                        # иначе этими буквами нельзя было бы начать поиск.
                         chosen = None
                         break
                     elif sym == " ":

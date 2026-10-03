@@ -1,19 +1,22 @@
+import codecs
+import html
 import os
 import sys
 import json
 import time
 import threading
 import webbrowser
+import subprocess
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QProcess, QUrl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStackedWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTableWidget, QTableWidgetItem, QPlainTextEdit, QComboBox,
-    QLineEdit, QDoubleSpinBox, QSpinBox, QHeaderView, QFrame, QMessageBox, QFormLayout,
+    QLineEdit, QDoubleSpinBox, QSpinBox, QHeaderView, QFrame, QFormLayout,
     QTextEdit, QListWidget, QListWidgetItem, QProgressBar,
 )
-from PySide6.QtGui import QFont, QColor, QPainter, QPen, QPalette
+from PySide6.QtGui import QFont, QColor, QPainter, QPen
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 import requests
@@ -23,6 +26,9 @@ MAIN_SCRIPT = str(BASE_DIR / "main.py")
 SETTINGS_PATH = BASE_DIR / "settings.json"
 OLLAMA = "http://localhost:11434"
 WEB = "http://localhost:1337"
+
+REQ_TIMEOUT = 1.5          # короткий таймаут: воркер должен быстро реагировать на stop()
+ALERT_EVERY_N = 5          # алерты опрашиваем реже статуса (см. StatusWorker.collect)
 
 try:
     import psutil
@@ -101,14 +107,58 @@ def _as_float(value, default=0.0):
         return default
 
 
+def _format_gb(value):
+    """Размер модели в ГБ: Ollama может вернуть size строкой — не роняем формат."""
+    size = _as_float(value, 0.0)
+    return f"{size / (1024 ** 3):.2f}"
+
+
+_PY_DEPS_CACHE = {}
+
+
+def _python_has_deps(exe):
+    """Проверяет, что интерпретатор реально может импортировать зависимости ядра."""
+    if exe in _PY_DEPS_CACHE:
+        return _PY_DEPS_CACHE[exe]
+    ok = False
+    try:
+        # основной набор: Qt-GUI + HTTP + звук; отсутствие любого = плохой кандидат
+        probe = "import requests, PySide6"
+        res = subprocess.run([exe, "-c", probe], capture_output=True, timeout=15)
+        ok = res.returncode == 0
+    except Exception:
+        ok = False
+    _PY_DEPS_CACHE[exe] = ok
+    return ok
+
+
 def find_python():
-    """Интерпретатор для запуска main.py: сначала venv проекта, иначе текущий."""
-    name = "python.exe" if os.name == "nt" else "python"
-    for rel in (BASE_DIR / "venv" / "bin" / name,
-                BASE_DIR.parent / "ai_env" / "bin" / name,
-                BASE_DIR / ".venv" / "bin" / name):
-        if rel.exists():
+    """Интерпретатор для запуска main.py: сначала venv проекта, иначе текущий.
+
+    Раскладка venv зависит от ОС: Scripts\\python.exe на Windows, bin/python на POSIX.
+    Кандидат проверяется на импорт зависимостей ядра; если ни один не подошёл,
+    возвращаем первый существующий (цепочка фолбэков сохраняется) или sys.executable.
+    """
+    if os.name == "nt":
+        bindir, name = "Scripts", "python.exe"
+    else:
+        bindir, name = "bin", "python"
+    candidates = [
+        BASE_DIR / "venv" / bindir / name,
+        BASE_DIR.parent / "ai_env" / bindir / name,
+        BASE_DIR / ".venv" / bindir / name,
+    ]
+    first_existing = None
+    for rel in candidates:
+        if not rel.exists():
+            continue
+        if first_existing is None:
+            first_existing = rel
+        # сначала — существующий рабочий ai_env-сосед, затем просто первый, кто импортирует зависимости
+        if _python_has_deps(str(rel)):
             return str(rel)
+    if first_existing is not None:
+        return str(first_existing)
     return sys.executable
 
 
@@ -187,41 +237,88 @@ class HealthRow(QWidget):
 # Worker статуса
 # --------------------------------------------------------------------------
 class StatusWorker(QThread):
+    """Фоновый опрос HTTP-API и файлов состояния.
+
+    Qt-объекты (QProcess) отсюда НЕ трогаем: GUI-поток кладёт снимок
+    состояния процесса в set_process_state(), воркер читает только эти
+    простые значения. Виджеты обновляются через сигналы.
+    """
+
     updated = Signal(dict)
+    alerts = Signal(list)
+    models = Signal(list)
 
     def __init__(self):
         super().__init__()
         self._stop = False
-        self.proc = None
+        self._lock = threading.Lock()
+        self._proc_running = False
+        self._proc_pid = 0
+        self._last_models = None
+        self._need_models = True
+        self._cycle = 0
 
-    def set_process(self, proc):
-        self.proc = proc
+    def request_models(self):
+        """Просьба из GUI-потока переслать список моделей даже без изменений."""
+        with self._lock:
+            self._need_models = True
+
+    def set_process_state(self, running, pid):
+        """Снимок QProcess, сделанный в GUI-потоке (QProcess не потокобезопасен)."""
+        with self._lock:
+            self._proc_running = bool(running)
+            self._proc_pid = _as_int(pid, 0)
+
+    def _proc_snapshot(self):
+        with self._lock:
+            return self._proc_running, self._proc_pid
 
     def run(self):
         while not self._stop:
             try:
-                self.updated.emit(self.collect())
+                data = self.collect()
             except Exception as e:            # QThread не должен падать из-за одного сбоя опроса
-                self.updated.emit({"error": str(e)})
+                data = {"error": str(e)}
+            if data and not self._stop:
+                raw_models = data.pop("_ollama_models", None)
+                if raw_models is not None:
+                    names = [str(m.get("name", "")) for m in raw_models if isinstance(m, dict)]
+                    with self._lock:
+                        need = self._need_models
+                        self._need_models = False
+                    if need or names != self._last_models:
+                        self._last_models = names
+                        self.models.emit(raw_models)
+                self.updated.emit(data)
             for _ in range(20):              # сон прерываемый: отключение не ждёт 2 секунды
                 if self._stop:
                     break
                 self.msleep(100)
 
     def collect(self):
+        """Последовательные запросы; между ними проверяем _stop для быстрого выхода."""
+        if self._stop:
+            return {}
         out = {}
+        raw_models = None
         try:
-            r = requests.get(OLLAMA + "/api/version", timeout=2)
+            r = requests.get(OLLAMA + "/api/version", timeout=REQ_TIMEOUT)
             ver = r.json().get("version", "?") if r.status_code == 200 else "?"
-            rm = requests.get(OLLAMA + "/api/tags", timeout=2)
-            models = rm.json().get("models", []) if rm.status_code == 200 else []
-            names = [m.get("name", "?") for m in models if isinstance(m, dict)]
+            if self._stop:
+                return {}
+            rm = requests.get(OLLAMA + "/api/tags", timeout=REQ_TIMEOUT)
+            if rm.status_code == 200:
+                raw_models = rm.json().get("models", [])
+            names = [str(m.get("name", "?")) for m in (raw_models or []) if isinstance(m, dict)]
             out["ollama"] = {"status": "ok", "version": ver, "models": names, "size": len(names)}
         except Exception as e:
-            out["ollama"] = {"status": "error", "detail": str(e), "version": "?", "size": 0}
+            out["ollama"] = {"status": "error", "detail": str(e), "version": "?", "size": 0, "models": []}
+        out["_ollama_models"] = raw_models
 
-        if self.proc is not None and self.proc.state() == QProcess.Running:
-            pid = self.proc.processId()
+        if self._stop:
+            return {}
+        running, pid = self._proc_snapshot()
+        if running and pid:
             cpu = mem = uptime = None
             if psutil:
                 try:
@@ -236,12 +333,16 @@ class StatusWorker(QThread):
         else:
             out["core"] = {"status": "stopped"}
 
+        if self._stop:
+            return {}
         try:
-            r = requests.get(WEB + "/", timeout=2)
+            r = requests.get(WEB + "/", timeout=REQ_TIMEOUT)
             out["web"] = {"status": "ok" if r.status_code == 200 else "error"}
         except Exception:
             out["web"] = {"status": "error", "detail": ""}
 
+        if self._stop:
+            return {}
         try:
             s = load_settings()
         except Exception:
@@ -250,6 +351,7 @@ class StatusWorker(QThread):
             "model": s.get("model", ""), "tts_voice": s.get("tts_voice", ""),
             "speed": s.get("speed_ai_speak", 1.0), "trigger": s.get("trigger_word", ""),
             "stt_mode": s.get("stt_mode", ""), "whisper": s.get("whispermodel", ""),
+            "tts_device": s.get("tts_device", ""),
         }
 
         # один try на файл: между exists() и stat() файл мог исчезнуть
@@ -267,6 +369,23 @@ class StatusWorker(QThread):
             out["memory"] = {"exists": True, "lines": lines}
         except OSError:
             out["memory"] = {"exists": False, "lines": 0}
+
+        # ВНИМАНИЕ: эндпоинт /api/alerts деструктивный — сервер очищает очередь
+        # при чтении (владелец эндпоинта — web_server.py, менять его нельзя).
+        # Поэтому опрашиваем РЕЖЕ статуса (раз в ALERT_EVERY_N циклов), чтобы
+        # браузерный UI успевал забрать алерты первым. Полностью
+        # неразрушающий вариант требует правки сервера (отдельный read-only
+        # эндпоинт или курсор прочитанного).
+        self._cycle += 1
+        if self._cycle % ALERT_EVERY_N == 0:
+            try:
+                ra = requests.get(WEB + "/api/alerts", timeout=REQ_TIMEOUT)
+                batch = ra.json().get("alerts", []) if ra.status_code == 200 else []
+                if batch and not self._stop:
+                    self.alerts.emit(batch)
+            except Exception:
+                # сеть отвалилась — локальный список в GUI не трогаем, ничего не теряем
+                pass
         return out
 
     def stop(self):
@@ -280,37 +399,85 @@ class LuchGUI(QMainWindow):
     log_msg = Signal(str)          # вызовы из рабочих потоков — только через сигналы
     chat_html = Signal(str)
     refresh_models = Signal()
+    play_file = Signal(str)        # скачанный аудиофайл → воспроизведение в GUI-потоке
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LUCH AI — Пульт управления")
         self.resize(1100, 720)
 
+        self._mic_names = []       # последний перечень микрофонов (для валидации sb_micro)
+        self._ram_total_mb = 0     # максимум для полосы RAM (иначе шкала клампится на 4096)
+
         self.player = QMediaPlayer()
         self.audio_out = QAudioOutput()
         self.player.setAudioOutput(self.audio_out)
 
         self.process = QProcess(self)
-        self.process.readyReadStandardOutput.connect(lambda: self._log(self.process.readAllStandardOutput().data().decode(errors="ignore").rstrip("\n")))
-        self.process.readyReadStandardError.connect(lambda: self._log(self.process.readAllStandardError().data().decode(errors="ignore").rstrip("\n")))
+        # Инкрементальные декодеры: русский текст/эмодзи могут рваться между чтениями
+        self._out_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._err_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.process.readyReadStandardOutput.connect(self._read_stdout)
+        self.process.readyReadStandardError.connect(self._read_stderr)
         self.process.finished.connect(self._on_finished)
+        self.process.errorOccurred.connect(self._on_proc_error)
+        self.process.started.connect(self._on_started)
 
         self.worker = StatusWorker()
-        self.worker.set_process(self.process)
         self.worker.updated.connect(self._on_status)
+        self.worker.alerts.connect(self._on_alerts)
+        self.worker.models.connect(self._on_models)
         self.worker.start()
 
-        self.alert_timer = QTimer(self)
-        self.alert_timer.timeout.connect(self.poll_alerts)
-        self.alert_timer.start(3000)
+        # QProcess живёт в GUI-потоке: снимок pid/state пишем здесь, воркер читает копию
+        self.proc_timer = QTimer(self)
+        self.proc_timer.timeout.connect(self._sync_process_state)
+        self.proc_timer.start(200)
 
         self._build_ui()
+        self._init_ram_total()
 
         # Qt-безопасные мосты: потоки не трогают виджеты напрямую
         # (подключаем после _build_ui — виджеты должны уже существовать)
         self.log_msg.connect(self._log)
         self.chat_html.connect(self.chat_out.append)
         self.refresh_models.connect(self.refresh_ollama)
+        self.play_file.connect(self._play_file)
+        self._sync_process_state()
+
+    # ---- Мосты GUI↔воркер: QProcess не трогаем из чужого потока ----
+    def _sync_process_state(self):
+        running = self.process.state() == QProcess.Running
+        pid = 0
+        if running:
+            try:
+                pid = _as_int(self.process.processId(), 0)
+            except Exception:
+                pid = 0
+        self.worker.set_process_state(running, pid)
+
+    def _init_ram_total(self):
+        """Верхняя граница шкалы RAM: не хардкодим 4096 (клампило процессы >4 ГБ)."""
+        total = 0
+        if psutil:
+            try:
+                total = int(psutil.virtual_memory().total / (1024 * 1024))
+            except Exception:
+                total = 0
+        self._ram_total_mb = total if total > 0 else 4096
+        self.mem_bar.setMaximum(self._ram_total_mb)
+
+    def _read_stdout(self):
+        data = self.process.readAllStandardOutput().data()
+        text = self._out_decoder.decode(bytes(data))
+        if text.strip():
+            self._log(text.rstrip("\n"))
+
+    def _read_stderr(self):
+        data = self.process.readAllStandardError().data()
+        text = self._err_decoder.decode(bytes(data))
+        if text.strip():
+            self._log(text.rstrip("\n"))
 
     def _build_ui(self):
         root = QWidget()
@@ -475,6 +642,7 @@ class LuchGUI(QMainWindow):
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setFont(QFont("Consolas", 9))
+        self.log.setMaximumBlockCount(2000)   # 24/7-монитор не должен расти бесконечно
         l.addWidget(self.log)
         return w
 
@@ -577,6 +745,10 @@ class LuchGUI(QMainWindow):
         return w
 
     # ---------------- Actions ----------------
+    def _reset_run_buttons(self):
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+
     def start_luch(self):
         if self.process.state() == QProcess.Running:
             return
@@ -584,8 +756,16 @@ class LuchGUI(QMainWindow):
         self.process.setProcessChannelMode(QProcess.MergedChannels)
         python = find_python()
         self.process.start(python, [MAIN_SCRIPT])
+        # start() асинхронен: без проверки кнопки показывали «запущено» даже если
+        # интерпретатор не стартовал (нет зависимостей, неверный путь).
+        if not self.process.waitForStarted(3000):
+            self._log(f">>> Не удалось запустить main.py ({python}): {self.process.errorString()}")
+            self._reset_run_buttons()
+            self._sync_process_state()
+            return
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        self._sync_process_state()
         self._log(f">>> Запуск main.py ({python})")
 
     def stop_luch(self):
@@ -595,65 +775,113 @@ class LuchGUI(QMainWindow):
             self._log(">>> Остановка LUCH...")
 
     def reload_in_luch(self):
+        # HTTP-запрос уводим с UI-потока (timeout 5 c замораживал бы окно)
+        threading.Thread(target=self._reload_worker, daemon=True).start()
+
+    def _reload_worker(self):
         try:
             r = requests.post(WEB + "/api/command", json={"cmd": "/reload_libs"}, timeout=5)
-            self._log(f">>> reload_libs: {r.json()}")
+            self.log_msg.emit(f">>> reload_libs: {r.json()}")
         except Exception as e:
-            self._log(f">>> Ошибка reload_libs: {e}")
+            self.log_msg.emit(f">>> Ошибка reload_libs: {e}")
 
     def list_mics(self):
+        saved = None
+        log = None
         try:
             import speech_recognition as sr
             from pathlib import Path as _Path
             import os as _os
-            import sys as _sys
             # ALSA/JACK пишут в stderr мимо Python — сворачиваем в logs/native.log
             log_path = _Path(__file__).resolve().parent / "logs" / "native.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
             log = open(log_path, "a", encoding="utf-8", errors="replace")
             saved = _os.dup(2)
             try:
                 _os.dup2(log.fileno(), 2)
                 names = sr.Microphone.list_microphone_names()
             finally:
-                _os.dup2(saved, 2)
-                _os.close(saved)
-                log.close()
+                # fd 2 восстанавливаем всегда, даже если перечисление упало
+                try:
+                    _os.dup2(saved, 2)
+                finally:
+                    _os.close(saved)
+                    saved = None
+                    log.close()
+                    log = None
+            self._mic_names = list(names)
             cur = load_settings().get("micro_index", 1)
             self.mic_info.setText("Микрофоны:\n" + "\n".join(f"[{i}] {n}" + ("  <-- выбран" if i == cur else "") for i, n in enumerate(names)))
         except Exception as e:
             self.mic_info.setText(f"Ошибка: {e}")
+        finally:
+            # страховка на случай падения между dup() и восстановлением
+            if saved is not None:
+                try:
+                    import os as _os
+                    _os.dup2(saved, 2)
+                    _os.close(saved)
+                except Exception:
+                    pass
+            if log is not None:
+                try:
+                    log.close()
+                except Exception:
+                    pass
 
     def apply_settings(self):
-        s = load_settings()
-        s.update({
+        # Читаем файл заново и перезаписываем ТОЛЬКО свои ключи: ядро пишет
+        # settings.json параллельно, слепой update на старом словаре терял бы
+        # его изменения. Запись атомарная (tmp + replace).
+        fresh = load_settings()
+        if not isinstance(fresh, dict):
+            fresh = {}
+        mic = self.sb_micro.value()
+        if self._mic_names and not (0 <= mic < len(self._mic_names)):
+            mic = max(0, min(mic, len(self._mic_names) - 1))
+            self.sb_micro.setValue(mic)
+            self._log(f">>> Индекс микрофона вне списка, скорректирован на {mic}")
+        fresh.update({
             "model": self.cb_model.currentText().strip(),
             "stt_mode": self.cb_stt.currentText(),
             "whispermodel": self.le_whisper.text().strip(),
             "trigger_word": self.le_trigger.text().strip(),
             "tts_voice": self.le_tts.text().strip(),
             "speed_ai_speak": self.sp_speed.value(),
-            "micro_index": self.sb_micro.value(),
+            "micro_index": mic,
         })
-        save_settings(s)
+        save_settings(fresh)
         self._log(">>> Настройки сохранены")
 
     def refresh_ollama(self):
+        """Список моделей тянет StatusWorker; UI-поток только запрашивает обновление."""
+        self.worker.request_models()
+
+    def _on_models(self, models):
+        """Обновление таблицы/комбобокса моделей в GUI-потоке (сигнал воркера)."""
+        models = [m for m in (models or []) if isinstance(m, dict)]
+        # форматирование отделено от сети: ошибка формата не = «Ollama недоступен»
         try:
-            r = requests.get(OLLAMA + "/api/tags", timeout=3)
-            models = r.json().get("models", [])
             self.ollama_table.setRowCount(len(models))
             for i, m in enumerate(models):
-                self.ollama_table.setItem(i, 0, QTableWidgetItem(m.get("name", "?")))
-                self.ollama_table.setItem(i, 1, QTableWidgetItem(f"{m.get('size', 0) / (1024 ** 3):.2f}"))
-                self.ollama_table.setItem(i, 2, QTableWidgetItem(m.get("modified_at", "")[:19].replace("T", " ")))
-            names = [m.get("name", "") for m in models]
+                self.ollama_table.setItem(i, 0, QTableWidgetItem(str(m.get("name", "?"))))
+                self.ollama_table.setItem(i, 1, QTableWidgetItem(_format_gb(m.get("size", 0))))
+                self.ollama_table.setItem(i, 2, QTableWidgetItem(str(m.get("modified_at", ""))[:19].replace("T", " ")))
+        except Exception as e:
+            self._log(f">>> Ошибка отображения моделей: {e}")
+        try:
+            names = [str(m.get("name", "")) for m in models if m.get("name")]
             cur = self.cb_model.currentText()
             self.cb_model.clear()
             self.cb_model.addItems(names)
             if cur:
+                # битый/отсутствующий в списке текущий выбор не должен молча
+                # подменяться первым элементом при следующем Save
+                if cur not in names:
+                    self.cb_model.insertItem(0, cur)
                 self.cb_model.setCurrentText(cur)
         except Exception as e:
-            self._log(f">>> Ollama недоступен: {e}")
+            self._log(f">>> Ошибка списка моделей: {e}")
 
     def pull_model(self):
         name = self.le_pull.text().strip()
@@ -675,48 +903,52 @@ class LuchGUI(QMainWindow):
         if not text:
             return
         self.chat_in.clear()
-        self.chat_html.emit(f"<b style='color:#89b4fa'>ВЫ:</b> {text}")
+        # html.escape: пользовательский текст не должен интерпретироваться как разметка
+        self.chat_html.emit(f"<b style='color:#89b4fa'>ВЫ:</b> {html.escape(text)}")
         threading.Thread(target=self._chat_worker, args=(text,), daemon=True).start()
 
     def _chat_worker(self, text):
         try:
             r = requests.post(WEB + "/api/ask", json={"text": text}, timeout=60)
             data = r.json()
-            self.chat_html.emit(f"<b style='color:#a6e3a1'>LUCH:</b> {data.get('response','')}")
+            reply = html.escape(str(data.get("response", "")))
+            self.chat_html.emit(f"<b style='color:#a6e3a1'>LUCH:</b> {reply}")
             if data.get("play_audio"):
                 self.chat_html.emit("<i style='color:#6c7086'>(озвучка на ПК)</i>")
         except Exception as e:
-            self.chat_html.emit(f"<span style='color:#f38ba8'>Ошибка: {e}</span>")
+            self.chat_html.emit(f"<span style='color:#f38ba8'>Ошибка: {html.escape(str(e))}</span>")
+
+    def _play_file(self, fp):
+        self.player.setSource(QUrl.fromLocalFile(fp))
+        self.player.play()
 
     def play_last_response(self):
-        try:
-            r = requests.get(WEB + "/api/audio", timeout=5)
-            if r.status_code == 200:
-                fp = "/tmp/luch_gui_resp.wav"
-                open(fp, "wb").write(r.content)
-                self.player.setSource(QUrl.fromLocalFile(fp))
-                self.player.play()
-        except Exception as e:
-            self._log(f">>> Ошибка воспроизведения: {e}")
-
-    def poll_alerts(self):
-        try:
-            r = requests.get(WEB + "/api/alerts", timeout=3)
-            for a in r.json().get("alerts", []):
-                self.alert_list.addItem(QListWidgetItem(f"⏰ {time.strftime('%H:%M:%S')} — {a.get('description','')}"))
-        except Exception:
-            pass
+        # скачивание в отдельном потоке, воспроизведение — по сигналу в GUI-потоке
+        threading.Thread(target=self._download_audio, args=(WEB + "/api/audio", "/tmp/luch_gui_resp.wav", "воспроизведения"), daemon=True).start()
 
     def play_alert_audio(self):
+        threading.Thread(target=self._download_audio, args=(WEB + "/api/alert_audio", "/tmp/luch_gui_alert.wav", "алерта"), daemon=True).start()
+
+    def _download_audio(self, url, fp, what):
         try:
-            r = requests.get(WEB + "/api/alert_audio", timeout=5)
+            r = requests.get(url, timeout=5)
             if r.status_code == 200:
-                fp = "/tmp/luch_gui_alert.wav"
-                open(fp, "wb").write(r.content)
-                self.player.setSource(QUrl.fromLocalFile(fp))
-                self.player.play()
+                Path(fp).write_bytes(r.content)
+                self.play_file.emit(fp)
         except Exception as e:
-            self._log(f">>> Ошибка алерта: {e}")
+            self.log_msg.emit(f">>> Ошибка {what}: {e}")
+
+    def _on_alerts(self, batch):
+        """Алерты пришли из воркера (сигнал). Локальный список не теряем при сбое сети."""
+        for a in batch or []:
+            try:
+                desc = a.get("description", "") if isinstance(a, dict) else str(a)
+                self.alert_list.addItem(QListWidgetItem(f"⏰ {time.strftime('%H:%M:%S')} — {desc}"))
+            except Exception:
+                continue
+        # не даём списку расти бесконечно в 24/7-режиме
+        while self.alert_list.count() > 500:
+            self.alert_list.takeItem(0)
 
     # ---------------- Статус ----------------
     def _on_status(self, d):
@@ -739,7 +971,8 @@ class LuchGUI(QMainWindow):
                 self.cpu_chart.push(cpu)
                 self.mem_chart.push(mem)
                 self.cpu_bar.setValue(max(0, min(int(cpu), 100)))
-                self.mem_bar.setValue(max(0, min(int(mem), 4096)))
+                # верхняя граница — реальный объём RAM (или 4096, если psutil недоступен)
+                self.mem_bar.setValue(max(0, min(int(mem), self.mem_bar.maximum())))
             self.hr["core"].set("ok", sub)
         else:
             self.hr["core"].set("stopped", "остановлен")
@@ -753,30 +986,61 @@ class LuchGUI(QMainWindow):
         self.hr["voice"].set("ok" if vp.get("exists") else "error", f"{vp.get('size_kb', 0)} КБ")
         mem = d.get("memory", {}) or {}
         self.hr["memory"].set("ok" if mem.get("exists") else "error", f"{mem.get('lines', 0)} строк")
-        self.hr["tts"].set("ok", f"{cfg.get('tts_voice')} x{cfg.get('speed')}")
-        self.hr["stt"].set("ok", f"{cfg.get('stt_mode')} • whisper: {cfg.get('whisper') or '—'}")
+        # TTS/STT: статус по фактическому значению из settings.json,
+        # без выдуманных эндпоинтов; пустое значение = сервис не настроен.
+        tts_voice = cfg.get("tts_voice") or ""
+        tts_device = cfg.get("tts_device") or ""
+        tts_metric = f"{tts_voice or 'не задан'} x{cfg.get('speed')}"
+        if tts_device:
+            tts_metric += f" • {tts_device}"
+        self.hr["tts"].set("ok" if tts_voice else "unknown", tts_metric)
+
+        stt_mode = cfg.get("stt_mode") or ""
+        stt_metric = stt_mode or "выключен"
+        if stt_mode == "whisper":
+            stt_metric += f" • whisper: {cfg.get('whisper') or '—'}"
+        self.hr["stt"].set("ok" if stt_mode else "stopped", stt_metric)
 
         overall = "OK" if (core.get("status") == "ok" and o.get("status") == "ok" and web.get("status") == "ok") else "ВНИМАНИЕ"
         self.status_bar.setText(f"Обновлено {time.strftime('%H:%M:%S')}  •  Состояние: {overall}  •  Ollama: {o.get('size', 0)} мод.  •  Ядро: {core.get('status', 'нет данных')}")
 
+    def _on_started(self):
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self._sync_process_state()
+
+    def _on_proc_error(self, err):
+        self._log(f">>> Ошибка процесса ({err}): {self.process.errorString()}")
+        if err == QProcess.FailedToStart or self.process.state() != QProcess.Running:
+            self._reset_run_buttons()
+        self._sync_process_state()
+
     def _on_finished(self, code, status):
         self._log(f">>> LUCH завершён (код {code})")
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
+        self._reset_run_buttons()
+        self._sync_process_state()
 
     def _log(self, msg):
-        if hasattr(self, "log"):
+        if hasattr(self, "log") and msg:
             self.log.appendPlainText(msg)
             self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
     def closeEvent(self, event):
+        # Детерминированное завершение: сначала гасим таймеры и воркер,
+        # затем процесс; QThread нельзя уничтожать запущенным.
         self.worker.stop()
-        self.alert_timer.stop()
+        self.proc_timer.stop()
         if self.process.state() == QProcess.Running:
             self.process.terminate()
             if not self.process.waitForFinished(3000):
                 self.process.kill()
-        self.worker.wait(3000)
+                self.process.waitForFinished(1000)
+        if not self.worker.wait(4000):
+            # последний довод: пишем в лог и только потом форсируем поток
+            self._log(">>> Фоновый поток статуса не завершился за 4 с — принудительное завершение")
+            self.worker.terminate()
+            if not self.worker.wait(1000):
+                self._log(">>> Поток статуса всё ещё работает")
         event.accept()
 
 
