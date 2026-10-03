@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ЛУЧ</string>
+    <string name="notif_channel_name">ЛУЧ — управление с ПК</string>
+    <string name="notif_channel_desc">Служебный канал, чтобы ИИ мог присылать команды телефону</string>
+    <string name="notif_service_text">ЛУЧ на связи: ИИ управляет этим телефоном</string>
+    <string name="notif_device_name">ЛУЧ</string>
+</resources>

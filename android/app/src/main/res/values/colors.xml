@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="luch_bg">#0B0F14</color>
+    <color name="luch_fg">#E6EDF3</color>
+    <color name="luch_accent">#4C8DFF</color>
+    <color name="ic_launcher_bg">#0B0F14</color>
+</resources>

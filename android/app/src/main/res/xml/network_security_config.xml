@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Сервер ЛУЧ живёт в локальной сети по обычному HTTP, а его IP у домашнего
+  роутера меняется при каждом переподключении. Поэтому cleartext разрешён
+  для любого адреса: приложение работает только в твоей сети и никуда
+  наружу ничего не отправляет.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>LUCH — терминал</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+    <link rel="stylesheet" href="/static/styles.css">
+
+    <!-- Leaflet — интерактивные карты (OpenStreetMap) -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+
+<div class="crt-lines" aria-hidden="true"></div>
+<div class="crt-glow" aria-hidden="true"></div>
+
+<!-- Рамка из псевдографики, как в настоящей консоли -->
+<div class="term-frame" aria-hidden="true">
+    <span class="fr fr-tl">╭</span><span class="fr fr-t" id="frTop"></span><span class="fr fr-tr">╮</span>
+    <span class="fr fr-l" id="frLeft"></span>
+    <span class="fr fr-r" id="frRight"></span>
+    <span class="fr fr-bl">╰</span><span class="fr fr-b" id="frBot"></span><span class="fr fr-br">╯</span>
+</div>
+
+<!-- ОКНО ТЕРМИНАЛА -->
+<div class="term-window">
+
+    <!-- Заголовок окна -->
+    <div class="term-titlebar">
+        <span class="tb-dots"><i class="d-red"></i><i class="d-yellow"></i><i class="d-green"></i></span>
+        <span class="tb-title">luch@luch:~$ &mdash; bash</span>
+        <span class="tb-tools">
+            <button class="tb-btn" id="cfgToggle" onclick="togglePanel('cfg')" title="Настройки ИИ, голоса и провайдера (Ctrl+K)">[CFG]</button>
+            <button class="tb-btn" id="menuToggle" onclick="togglePanel('menu')" title="Меню команд (F2)">[MENU]</button>
+            <button class="tb-btn" id="aiToggle" onclick="togglePanel('ai')" title="Команды ИИ и их вывод (F3)">[AI CMD]</button>
+            <button class="tb-btn" id="inputToggle" onclick="toggleInputBar()" title="Скрыть / показать строку ввода">[INPUT]</button>
+            <button class="tb-btn" id="threeToggle" onclick="toggleThree()" title="Включить / выключить 3D-визуализацию">[3D]</button>
+            <button class="tb-btn" id="mapToggle" onclick="toggleMap()" title="Карта / навигатор">[MAP]</button>
+        </span>
+    </div>
+
+    <!-- Поток вывода терминала. Промпт находится в самом конце потока, как в shell. -->
+    <div class="chat-container" id="chatContainer">
+        <div class="term-boot" id="termBoot">
+            <pre class="banner" id="banner"></pre>
+            <div class="boot-line" id="bootLine"></div>
+        </div>
+
+        <!-- Карта геолокации / навигатора -->
+        <div id="mapPanel">
+            <div id="map"></div>
+            <div class="map-controls">
+                <span class="map-status" id="mapStatus">Геолокация не определена</span>
+                <input type="text" id="navDest" placeholder="куда едем? (адрес или фраза)" autocomplete="off">
+                <button class="btn btn-send" id="navBuildBtn" onclick="buildRoute()">маршрут</button>
+                <button class="btn btn-send" id="navStopBtn" onclick="stopNavMode()" style="display:none">стоп</button>
+                <button class="loc-btn" id="recenterBtn" onclick="centerOnUser()" title="Центр на мне">◎</button>
+            </div>
+            <div id="navManeuverBanner" class="nav-maneuver" style="display:none">
+                <span id="navManeuverText">Ищем манёвр...</span>
+                <span id="navManeuverDist" class="nav-maneuver-dist"></span>
+            </div>
+        </div>
+
+        <!-- Строка ввода: промпт в конце потока -->
+        <div class="input-container" id="inputContainer">
+            <span class="ts" id="promptTs">--:--:--</span>
+            <span class="prompt">❯</span>
+            <input type="text" id="userInput" onkeydown="handleKey(event)" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="командная строка">
+            <span class="input-tools">
+                <button class="icon-btn" id="micToggle" onclick="toggleAlwaysListening()" title="Микрофон: всегда слушать" aria-label="Микрофон">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+                        <rect x="9" y="2.5" width="6" height="11" rx="3"></rect>
+                        <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0"></path>
+                        <path d="M12 18v3.5"></path>
+                    </svg>
+                    <i class="rec-dot"></i>
+                </button>
+                <button class="icon-btn" id="sendBtn" onclick="sendMessage()" title="Отправить (Enter)" aria-label="Отправить">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 19.5V5"></path>
+                        <path d="M5.5 11.5 12 5l6.5 6.5"></path>
+                    </svg>
+                </button>
+            </span>
+        </div>
+    </div>
+
+    <!-- Статус-бар -->
+    <div class="statusbar">
+        <span class="sb-item"><i class="dot" id="sbLiveDot"></i><span id="sbState">READY</span></span>
+        <span class="sb-item" id="sbModel" title="Активный провайдер и модель">MODEL --</span>
+        <span class="sb-item" id="sbMic">MIC OFF</span>
+        <span class="sb-item" id="sbThree">3D ON</span>
+        <span class="sb-item sb-grow"></span>
+        <span class="sb-item sb-hint">^K config &middot; F2 menu &middot; ^L clear</span>
+        <span class="sb-item" id="sbTime">--:--:--</span>
+    </div>
+</div>
+
+<!-- ══════════════ ПАНЕЛЬ CONFIG ══════════════ -->
+<div class="panel" id="cfgPanel" hidden>
+    <div class="panel-box">
+        <div class="panel-head">
+            <span class="panel-title">CONFIG</span>
+            <span class="panel-sub" id="cfgSub">провайдер и параметры</span>
+            <button class="panel-x" onclick="togglePanel('cfg')" aria-label="Закрыть">&times;</button>
+        </div>
+
+        <div class="panel-body">
+            <div class="field-title">ПРОВАЙДЕР ИИ</div>
+            <div class="prov-list" id="provList"><div class="log dim">загрузка провайдеров…</div></div>
+            <div class="btn-row">
+                <button class="btn btn-primary" onclick="newCustomProvider()">+ добавить кастомного</button>
+            </div>
+            <div class="note" id="provNote">Выбери провайдера — модель, ключ и адрес настраиваются в его карточке ниже.</div>
+
+            <div class="field-title" id="cfgCardTitle">КАСТОМНЫЙ ПРОВАЙДЕР</div>
+
+            <label class="row">
+                <span class="row-k">название</span>
+                <input id="cfgName" class="inp" type="text" spellcheck="false" autocomplete="off"
+                       placeholder="DeepSeek / Groq / мой vLLM" oninput="markDirty()">
+            </label>
+
+            <label class="row">
+                <span class="row-k">base_url</span>
+                <input id="cfgBaseUrl" class="inp" type="text" spellcheck="false" autocomplete="off"
+                       placeholder="http://127.0.0.1:8000/v1" oninput="onBaseUrlInput()">
+            </label>
+
+            <label class="row">
+                <span class="row-k">api_key</span>
+                <input id="cfgApiKey" class="inp" type="password" spellcheck="false" autocomplete="off"
+                       placeholder="необязательно — оставь пустым, чтобы не менять" oninput="markDirty()">
+            </label>
+
+            <label class="row">
+                <span class="row-k">model</span>
+                <input id="cfgModel" class="inp" type="text" spellcheck="false" autocomplete="off"
+                       list="cfgModelList" placeholder="deepseek-chat" oninput="markDirty()">
+                <datalist id="cfgModelList"></datalist>
+            </label>
+
+            <label class="row">
+                <span class="row-k">timeout</span>
+                <input id="cfgTimeout" class="inp inp-num" type="number" min="5" max="900" step="5"
+                       placeholder="120" oninput="markDirty()">
+            </label>
+
+            <div class="btn-row">
+                <button class="btn" onclick="fetchAiModels(this)">загрузить модели</button>
+                <button class="btn" onclick="testAiEndpoint(this)">проверить</button>
+                <button class="btn btn-primary" onclick="saveAiEndpoint(this)">сохранить и применить</button>
+                <button class="btn btn-danger" onclick="deleteSelectedProvider()">удалить</button>
+            </div>
+            <div class="note" id="cfgAiNote">Любой OpenAI-совместимый адрес: vLLM, LM Studio, llama.cpp,
+                Ollama, OpenRouter, DeepSeek, прокси. Ключ можно не указывать.</div>
+            <div class="log" id="cfgAiLog"></div>
+
+            <div class="field-title">ДОСТУП К САЙТУ</div>
+            <label class="row">
+                <span class="row-k">web_token</span>
+                <input id="cfgToken" class="inp" type="password" spellcheck="false" autocomplete="off"
+                       placeholder="если сервер требует токен" oninput="saveToken()">
+            </label>
+            <div class="note">Хранится только в этом браузере. Вводи его, если в настройках LUCH задан web_token.</div>
+
+            <div class="field-title">ГОЛОС И РАСПОЗНАВАНИЕ</div>
+
+            <label class="row">
+                <span class="row-k">tts_voice</span>
+                <input id="cfgTts" class="inp" type="text" spellcheck="false" placeholder="eugene">
+            </label>
+            <label class="row">
+                <span class="row-k">tts_device</span>
+                <select id="cfgTtsDevice" class="inp">
+                    <option value="auto">auto — видеокарта, если есть</option>
+                    <option value="cuda">cuda — только видеокарта</option>
+                    <option value="cpu">cpu — процессор</option>
+                </select>
+            </label>
+            <label class="row">
+                <span class="row-k">скорость</span>
+                <input id="cfgSpeed" class="inp inp-num" type="number" min="0.5" max="3" step="0.1" placeholder="1.0">
+            </label>
+            <label class="row">
+                <span class="row-k">триггер</span>
+                <input id="cfgTrigger" class="inp" type="text" spellcheck="false" placeholder="луч">
+            </label>
+            <label class="row">
+                <span class="row-k">stt_mode</span>
+                <select id="cfgStt" class="inp">
+                    <option value="whisper">whisper</option>
+                    <option value="google">google</option>
+                </select>
+            </label>
+            <label class="row">
+                <span class="row-k">микрофон</span>
+                <input id="cfgMicro" class="inp inp-num" type="number" min="0" max="20" step="1" placeholder="1">
+            </label>
+            <label class="row">
+                <span class="row-k">whisper</span>
+                <input id="cfgWhisper" class="inp" type="text" spellcheck="false" placeholder="turbo">
+            </label>
+
+            <div class="btn-row">
+                <button class="btn btn-primary" onclick="saveVoiceSettings(this)">применить голос</button>
+            </div>
+            <div class="log" id="cfgVoiceLog"></div>
+        </div>
+    </div>
+</div>
+
+<!-- ══════════════ ПАНЕЛЬ MENU ══════════════ -->
+<div class="panel" id="menuPanel" hidden>
+    <div class="panel-box">
+        <div class="panel-head">
+            <span class="panel-title">MENU</span>
+            <span class="panel-sub" id="menuSub">пункты меню и команды</span>
+            <button class="panel-x" onclick="togglePanel('menu')" aria-label="Закрыть">&times;</button>
+        </div>
+        <div class="panel-body" id="menuBody">
+            <div class="log">загрузка меню…</div>
+        </div>
+        <div class="panel-foot">
+            <span class="note">Клик по пункту выполняет его. Пункты, ждущие ввода в терминале, открывают нужное поле в CONFIG.</span>
+        </div>
+        <div class="menu-out" id="menuOut"></div>
+        <div class="log" id="menuLog"></div>
+    </div>
+</div>
+
+<!-- ПАНЕЛЬ: команды ИИ и их вывод -->
+<div class="panel" id="aiPanel" hidden>
+    <div class="panel-box">
+        <div class="panel-head">
+            <span class="panel-title">AI CMD</span>
+            <span class="panel-sub" id="aiSub">команды ИИ и вывод</span>
+            <button class="panel-x" onclick="togglePanel('ai')" aria-label="Закрыть">&times;</button>
+        </div>
+        <div class="panel-body" id="aiBody">
+            <div class="log">загрузка команд ИИ…</div>
+        </div>
+        <div class="panel-foot">
+            <span class="note">Клик по команде раскрывает её аргументы. «▶» выполняет команду и показывает вывод ниже. Опасные команды спрашивают подтверждение.</span>
+            <button class="btn btn-small" onclick="clearAiLog()">очистить вывод</button>
+        </div>
+        <div class="menu-out" id="aiOut"></div>
+        <div class="log" id="aiLog"></div>
+    </div>
+</div>
+
+<audio id="audioPlayer"></audio>
+<!-- UI ЭКРАННОЙ ГОЛОГРАММЫ-ЯДРА 3.0 -->
+<div id="screensaver-ui">
+    <div id="three-canvas-container"></div>
+    <div class="screensaver-vignette"></div>
+    <div class="holo-status" id="holoStatus">РЕЖИМ: ПОКОЙ</div>
+    <button class="exit-screensaver-btn" onclick="hideScreensaver()">СВЕРНУТЬ ИНТЕРФЕЙС / АНАЛИЗ ДАННЫХ</button>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+# Зависимости проекта ЛУЧ (v1.8)
+# Установка:  python -m pip install -r requirements.txt
+#
+# ВАЖНО: torch и torchaudio для CUDA ставятся из отдельного индекса PyTorch:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130
+# Версии ниже соответствуют рабочему окружению ai_env (Python 3.14, CUDA 13.0).
+
+# --- Ядро: голос ---
+torch==2.13.0
+torchaudio==2.11.0
+ctranslate2==4.8.1
+faster-whisper==1.2.1
+SpeechRecognition==3.17.0
+speechbrain==1.1.0
+silero-tts==0.0.5
+soundfile==0.14.0
+librosa==0.11.0
+av==18.0.0
+
+# --- Аудио ввод/вывод ---
+pygame-ce==2.5.7
+
+# --- Обработка сигналов и голосовой отпечаток ---
+numpy==2.4.6
+scipy==1.18.0
+python_speech_features==0.6
+
+# --- Веб-сервер и API ---
+fastapi==0.140.0
+starlette==1.3.1
+uvicorn==0.51.0
+pydantic==2.13.4
+
+# --- ИИ-провайдеры ---
+ollama==0.6.2
+requests==2.34.2
+ddgs==9.14.4
+
+# --- Интерфейс ---
+rich==15.0.0
+colorama==0.4.6
+art==6.5
+PySide6==6.11.1
+
+# --- Система ---
+psutil==7.2.2

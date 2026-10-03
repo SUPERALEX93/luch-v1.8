@@ -1,0 +1,43 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+ai_env/
+
+# --- Рантайм-данные и логи ---
+logs/
+*.log
+
+# --- Секреты и локальные настройки (не коммитить!) ---
+settings.json
+settings.json.broken
+settings.json.tmp
+memory.txt
+devices.json
+luch-key.pem
+luch-cert.pem
+luch-cert.json
+
+# --- Генерируемое аудио ---
+temp.wav
+response.wav
+output_speechbrain.wav
+voice16.wav
+
+# --- Android / Gradle ---
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# --- Прочее ---
+.DS_Store
+*.swp
