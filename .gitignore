@@ -26,6 +26,25 @@ response.wav
 output_speechbrain.wav
 voice16.wav
 
+# --- Биометрия и персональные данные (НЕ публиковать!) ---
+# Эталон голоса владельца и лог фраз, сказанных чужими голосами.
+my_voice_profile.wav
+phrases_not_spoken_in_my_voice.txt
+*.wav
+
+# --- Модели и веса (качаются отдельно, десятки мегабайт) ---
+pretrained_models/
+weights/
+models/
+*.pt
+*.pth
+*.ts
+*.ckpt
+*.onnx
+*.safetensors
+*.h5
+*.tflite
+
 # --- Android / Gradle ---
 android/.gradle/
 android/.kotlin/
